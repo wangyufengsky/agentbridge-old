@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -152,6 +153,19 @@ public final class ToolCallTracker {
         @NotNull ToolCallRecord.RoutingType routingType,
         @Nullable String toolUseId
     ) {
+        return acpRegister(acpClientId, acpName, acpTitle, args, kind, routingType, toolUseId, null);
+    }
+
+    public synchronized @NotNull ToolCallRecord acpRegister(
+        @NotNull String acpClientId,
+        @Nullable String acpName,
+        @NotNull String acpTitle,
+        @Nullable JsonObject args,
+        @Nullable String kind,
+        @NotNull ToolCallRecord.RoutingType routingType,
+        @Nullable String toolUseId,
+        @Nullable String agentSessionId
+    ) {
         int seq = ++acpSequence;
 
         // Priority 0: toolUseId direct match (Claude CLI)
@@ -161,7 +175,9 @@ public final class ToolCallTracker {
                 ToolCallRecord callRecord = liveRecords.get(existingRecordId);
                 if (callRecord != null && callRecord.getAcpClientId() == null) {
                     callRecord.setAcpFields(acpClientId, acpName, acpTitle, args, routingType, seq);
+                    callRecord.setAgentSessionId(agentSessionId);
                     acpIdToRecordId.put(acpClientId, existingRecordId);
+                    associateCancellationOwner(callRecord);
                     LOG.info("ToolCallTracker [ACP]: correlated via toolUseId=" + toolUseId + " → " + existingRecordId);
                     fireOnCorrelated(callRecord);
                     flushOlderUncorrelatedMcpRecords(existingRecordId);
@@ -173,7 +189,8 @@ public final class ToolCallTracker {
         String argsHash = args != null ? ToolCallHasher.computeBaseHash(args) : null;
         if (argsHash != null) {
             ToolCallRecord matched = tryAcpCorrelateByArgsHash(
-                argsHash, acpClientId, acpName, acpTitle, args, routingType, seq, toolUseId);
+                argsHash, acpClientId, acpName, acpTitle, args, routingType, seq, toolUseId,
+                agentSessionId);
             if (matched != null) return matched;
         }
 
@@ -181,6 +198,7 @@ public final class ToolCallTracker {
         String recordId = allocateRecordId();
         ToolCallRecord callRecord = new ToolCallRecord(recordId, argsHash);
         callRecord.setAcpFields(acpClientId, acpName, acpTitle, args, routingType, seq);
+        callRecord.setAgentSessionId(agentSessionId);
         if (kind != null) callRecord.setKind(kind);
 
         liveRecords.put(recordId, callRecord);
@@ -200,11 +218,22 @@ public final class ToolCallTracker {
         @Nullable String kind,
         @Nullable String toolUseId
     ) {
+        return mcpRegister(toolName, args, kind, toolUseId, null);
+    }
+
+    public synchronized @NotNull ToolCallRecord mcpRegister(
+        @NotNull String toolName,
+        @NotNull JsonObject args,
+        @Nullable String kind,
+        @Nullable String toolUseId,
+        @Nullable String mcpTransportSessionKey
+    ) {
         long startTime = System.currentTimeMillis();
 
         // Priority 0: toolUseId direct match
         if (toolUseId != null) {
-            ToolCallRecord correlated = tryMcpCorrelateByToolUseId(toolName, args, kind, startTime, toolUseId);
+            ToolCallRecord correlated = tryMcpCorrelateByToolUseId(
+                toolName, args, kind, startTime, toolUseId, mcpTransportSessionKey);
             if (correlated != null) return correlated;
         }
 
@@ -213,7 +242,9 @@ public final class ToolCallTracker {
         ToolCallRecord acpFirst = findNewestUnmatchedAcpRecord(argsHash);
         if (acpFirst != null) {
             acpFirst.setMcpFields(toolName, args, kind, startTime);
+            acpFirst.setMcpTransportSessionKey(mcpTransportSessionKey);
             if (toolUseId != null) toolUseIdToRecordId.put(toolUseId, acpFirst.getRecordId());
+            associateCancellationOwner(acpFirst);
             LOG.info("ToolCallTracker [MCP]: correlated via hash=" + argsHash + " → " + acpFirst.getRecordId());
             fireOnCorrelated(acpFirst);
             return acpFirst;
@@ -223,6 +254,7 @@ public final class ToolCallTracker {
         String recordId = allocateRecordId();
         ToolCallRecord callRecord = new ToolCallRecord(recordId, argsHash);
         callRecord.setMcpFields(toolName, args, kind, startTime);
+        callRecord.setMcpTransportSessionKey(mcpTransportSessionKey);
 
         liveRecords.put(recordId, callRecord);
         if (toolUseId != null) toolUseIdToRecordId.put(toolUseId, recordId);
@@ -237,13 +269,15 @@ public final class ToolCallTracker {
         @NotNull String argsHash,
         @NotNull String acpClientId, @Nullable String acpName, @NotNull String acpTitle,
         @NotNull JsonObject args, @NotNull ToolCallRecord.RoutingType routingType, int seq,
-        @Nullable String toolUseId
+        @Nullable String toolUseId, @Nullable String agentSessionId
     ) {
         ToolCallRecord mcpFirst = findNewestUnmatchedMcpRecord(argsHash);
         if (mcpFirst == null) return null;
         mcpFirst.setAcpFields(acpClientId, acpName, acpTitle, args, routingType, seq);
+        mcpFirst.setAgentSessionId(agentSessionId);
         acpIdToRecordId.put(acpClientId, mcpFirst.getRecordId());
         if (toolUseId != null) toolUseIdToRecordId.put(toolUseId, mcpFirst.getRecordId());
+        associateCancellationOwner(mcpFirst);
         LOG.info("ToolCallTracker [ACP]: correlated via hash=" + argsHash + " → " + mcpFirst.getRecordId());
         fireOnCorrelated(mcpFirst);
         flushOlderUncorrelatedMcpRecords(mcpFirst.getRecordId());
@@ -253,7 +287,7 @@ public final class ToolCallTracker {
     @Nullable
     private ToolCallRecord tryMcpCorrelateByToolUseId(
         @NotNull String toolName, @NotNull JsonObject args, @Nullable String kind,
-        long startTime, @NotNull String toolUseId
+        long startTime, @NotNull String toolUseId, @Nullable String mcpTransportSessionKey
     ) {
         String existingRecordId = toolUseIdToRecordId.get(toolUseId);
         if (existingRecordId == null) {
@@ -263,7 +297,9 @@ public final class ToolCallTracker {
             for (ToolCallRecord r : liveRecords.values()) {
                 if (toolUseId.equals(r.getAcpClientId()) && r.getMcpToolName() == null) {
                     r.setMcpFields(toolName, args, kind, startTime);
+                    r.setMcpTransportSessionKey(mcpTransportSessionKey);
                     toolUseIdToRecordId.put(toolUseId, r.getRecordId());
+                    associateCancellationOwner(r);
                     LOG.info("ToolCallTracker [MCP]: correlated via acpClientId=" + toolUseId + " → " + r.getRecordId());
                     fireOnCorrelated(r);
                     return r;
@@ -273,12 +309,23 @@ public final class ToolCallTracker {
             ToolCallRecord callRecord = liveRecords.get(existingRecordId);
             if (callRecord != null && callRecord.getMcpToolName() == null) {
                 callRecord.setMcpFields(toolName, args, kind, startTime);
+                callRecord.setMcpTransportSessionKey(mcpTransportSessionKey);
+                associateCancellationOwner(callRecord);
                 LOG.info("ToolCallTracker [MCP]: correlated via toolUseId=" + toolUseId + " → " + existingRecordId);
                 fireOnCorrelated(callRecord);
                 return callRecord;
             }
         }
         return null;
+    }
+
+    private void associateCancellationOwner(@NotNull ToolCallRecord callRecord) {
+        String agentSessionId = callRecord.getAgentSessionId();
+        String transportSessionKey = callRecord.getMcpTransportSessionKey();
+        if (agentSessionId != null && transportSessionKey != null) {
+            InFlightMcpToolRegistry.getInstance(project)
+                .associateAgentSession(agentSessionId, transportSessionKey);
+        }
     }
 
     // ── Completion ───────────────────────────────────────────────────────────
@@ -326,10 +373,12 @@ public final class ToolCallTracker {
             if (mcpFirst != null) {
                 callRecord.setMcpFields(mcpFirst.getMcpToolName(), mcpFirst.getMcpArgs(),
                     mcpFirst.getKind(), mcpFirst.getMcpStartedAt());
+                callRecord.setMcpTransportSessionKey(mcpFirst.getMcpTransportSessionKey());
                 if (mcpFirst.getMcpResult() != null) {
                     callRecord.setMcpResult(mcpFirst.getMcpResult(), mcpFirst.isMcpSuccess());
                 }
                 liveRecords.remove(mcpFirst.getRecordId());
+                associateCancellationOwner(callRecord);
                 LOG.info("ToolCallTracker: acpProvideArgs correlated " + recordId + " via late hash=" + newHash);
                 fireOnCorrelated(callRecord);
                 flushOlderUncorrelatedMcpRecords(recordId);
@@ -407,6 +456,35 @@ public final class ToolCallTracker {
             fireOnFlushed(r);
         }
         if (!all.isEmpty()) LOG.debug("ToolCallTracker: cleared " + all.size() + " records");
+    }
+
+    /**
+     * Fails and flushes records belonging to one AI/ACP session without touching MCP-only calls
+     * from external clients or records owned by another AI session.
+     */
+    public synchronized void stopAgentSession(
+        @NotNull String agentSessionId,
+        @NotNull String reason
+    ) {
+        List<ToolCallRecord> matching = liveRecords.values().stream()
+            .filter(record -> agentSessionId.equals(record.getAgentSessionId()))
+            .toList();
+        if (matching.isEmpty()) return;
+
+        Set<String> recordIds = matching.stream()
+            .map(ToolCallRecord::getRecordId)
+            .collect(java.util.stream.Collectors.toSet());
+        liveRecords.entrySet().removeIf(entry -> recordIds.contains(entry.getKey()));
+        acpIdToRecordId.entrySet().removeIf(entry -> recordIds.contains(entry.getValue()));
+        toolUseIdToRecordId.entrySet().removeIf(entry -> recordIds.contains(entry.getValue()));
+
+        for (ToolCallRecord record : matching) {
+            record.setState(ToolCallRecord.State.FAILED);
+            fireOnAgentStopped(record, reason);
+            fireOnFlushed(record);
+        }
+        LOG.info("ToolCallTracker: failed " + matching.size()
+            + " in-flight record(s) for AI session " + agentSessionId + " — " + reason);
     }
 
     /**

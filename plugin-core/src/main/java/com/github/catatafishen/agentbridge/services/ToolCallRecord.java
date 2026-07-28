@@ -69,6 +69,7 @@ public final class ToolCallRecord {
     // ── ACP-side (set when ACP reports) ──────────────────────────────────────
 
     private @Nullable String acpClientId;
+    private @Nullable String agentSessionId;
     private @Nullable String acpName;
     private @Nullable String acpTitle;
     private @Nullable JsonObject acpArgs;
@@ -78,6 +79,7 @@ public final class ToolCallRecord {
     // ── MCP-side (set when MCP executes) ─────────────────────────────────────
 
     private @Nullable String mcpToolName;
+    private @Nullable String mcpTransportSessionKey;
     private @Nullable JsonObject mcpArgs;
     private @Nullable String mcpResult;
     private boolean mcpSuccess;
@@ -179,6 +181,14 @@ public final class ToolCallRecord {
         this.acpArgs = args;
     }
 
+    void setAgentSessionId(@Nullable String agentSessionId) {
+        this.agentSessionId = agentSessionId;
+    }
+
+    void setMcpTransportSessionKey(@Nullable String mcpTransportSessionKey) {
+        this.mcpTransportSessionKey = mcpTransportSessionKey;
+    }
+
     // ── State ────────────────────────────────────────────────────────────────
 
     void setState(@NotNull State state) {
@@ -216,6 +226,10 @@ public final class ToolCallRecord {
         return acpClientId;
     }
 
+    public @Nullable String getAgentSessionId() {
+        return agentSessionId;
+    }
+
     public @Nullable String getAcpName() {
         return acpName;
     }
@@ -239,6 +253,10 @@ public final class ToolCallRecord {
     // MCP-side
     public @Nullable String getMcpToolName() {
         return mcpToolName;
+    }
+
+    public @Nullable String getMcpTransportSessionKey() {
+        return mcpTransportSessionKey;
     }
 
     public @Nullable JsonObject getMcpArgs() {

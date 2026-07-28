@@ -16,205 +16,177 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
-/**
- * Unit tests for {@link InFlightMcpToolRegistry}.
- *
- * <p>Constructs the registry directly (bypassing project-service lookup) since the
- * per-project instance only stores an in-memory map.
- */
 class InFlightMcpToolRegistryTest {
 
-    private final InFlightMcpToolRegistry registry = new InFlightMcpToolRegistry(mock(Project.class));
+    private static final String AI_SESSION = "agent-session-1";
+    private static final String AI_TRANSPORT = "http:ai-transport";
+    private static final String EXTERNAL_TRANSPORT = "http:sql-review";
+
+    private final InFlightMcpToolRegistry registry =
+        new InFlightMcpToolRegistry(mock(Project.class));
 
     @Test
-    void cancelAll_completesRegisteredFutures_withCancellationException() {
-        CompletableFuture<String> a = new CompletableFuture<>();
-        CompletableFuture<String> b = new CompletableFuture<>();
-        registry.register("a", a);
-        registry.register("b", b);
+    void cancelAgentSession_cancelsOnlyItsTransportFuture() {
+        registry.associateAgentSession(AI_SESSION, AI_TRANSPORT);
+        CompletableFuture<String> ai = new CompletableFuture<>();
+        CompletableFuture<String> external = new CompletableFuture<>();
+        registry.register(AI_TRANSPORT, "ai", ai);
+        registry.register(EXTERNAL_TRANSPORT, "external", external);
 
-        registry.cancelAll("agent stopped");
+        registry.cancelAgentSession(AI_SESSION, "agent stopped");
 
-        assertCancelledWith(a, "agent stopped");
-        assertCancelledWith(b, "agent stopped");
+        assertCancelledWith(ai, "agent stopped");
+        assertFalse(external.isDone(),
+            "Stopping an IDE AI session must not cancel an external MCP client's call");
     }
 
     @Test
-    void cancelAll_emptyRegistry_doesNotThrow() {
-        assertDoesNotThrow(() -> registry.cancelAll("test"));
+    void cancelAgentSession_cancelsEveryTransportAssociatedAfterReconnect() {
+        String reconnectedTransport = "http:ai-reconnected";
+        registry.associateAgentSession(AI_SESSION, AI_TRANSPORT);
+        registry.associateAgentSession(AI_SESSION, reconnectedTransport);
+        CompletableFuture<String> original = new CompletableFuture<>();
+        CompletableFuture<String> reconnected = new CompletableFuture<>();
+        registry.register(AI_TRANSPORT, "original", original);
+        registry.register(reconnectedTransport, "reconnected", reconnected);
+
+        registry.cancelAgentSession(AI_SESSION, "agent stopped");
+
+        assertCancelledWith(original, "agent stopped");
+        assertCancelledWith(reconnected, "agent stopped");
     }
 
     @Test
-    void unregister_removesFuture_soCancelAllIsNoOp() {
-        CompletableFuture<String> a = new CompletableFuture<>();
-        registry.register("a", a);
-        registry.unregister("a");
+    void cancelAgentSession_interruptsOnlyItsWorker() throws Exception {
+        registry.associateAgentSession(AI_SESSION, AI_TRANSPORT);
+        WorkerProbe ai = startWorker(AI_TRANSPORT, "ai-worker");
+        WorkerProbe external = startWorker(EXTERNAL_TRANSPORT, "external-worker");
 
-        registry.cancelAll("agent stopped");
+        registry.cancelAgentSession(AI_SESSION, "agent stopped");
 
-        assertFalse(a.isDone(), "Unregistered future must not be completed by cancelAll");
+        assertTrue(ai.finished().await(2, TimeUnit.SECONDS));
+        assertTrue(ai.interrupted().get());
+        assertFalse(external.interrupted().get());
+        external.thread().interrupt();
+        assertTrue(external.finished().await(2, TimeUnit.SECONDS));
     }
 
     @Test
-    void cancelAll_doesNotOverwriteAlreadyCompletedFutures() throws Exception {
-        CompletableFuture<String> a = new CompletableFuture<>();
-        a.complete("real-user-answer");
-        registry.register("a", a);
+    void cancelledAgentSession_rejectsLateAiRegistration_butNotExternalRegistration() {
+        registry.associateAgentSession(AI_SESSION, AI_TRANSPORT);
+        registry.cancelAgentSession(AI_SESSION, "agent stopped");
 
-        registry.cancelAll("agent stopped");
+        CompletableFuture<String> lateAi = new CompletableFuture<>();
+        CompletableFuture<String> external = new CompletableFuture<>();
+        registry.register(AI_TRANSPORT, "late-ai", lateAi);
+        registry.register(EXTERNAL_TRANSPORT, "external", external);
 
-        assertEquals("real-user-answer", a.get(1, TimeUnit.SECONDS));
+        assertCancelledWith(lateAi, "agent stopped");
+        assertFalse(external.isDone());
     }
 
     @Test
-    void cancelAll_isIdempotent() {
-        CompletableFuture<String> a = new CompletableFuture<>();
-        registry.register("a", a);
+    void associationAfterCancellation_closesLateCorrelationRace() {
+        registry.cancelAgentSession(AI_SESSION, "agent stopped");
+        CompletableFuture<String> alreadyRunning = new CompletableFuture<>();
+        registry.register(AI_TRANSPORT, "running", alreadyRunning);
 
-        registry.cancelAll("first");
-        assertDoesNotThrow(() -> registry.cancelAll("second"));
+        registry.associateAgentSession(AI_SESSION, AI_TRANSPORT);
 
-        // First cancellation wins.
-        assertCancelledWith(a, "first");
+        assertCancelledWith(alreadyRunning, "agent stopped");
     }
 
     @Test
-    void register_afterCancelAll_immediatelyCancelsLateFuture() {
-        registry.cancelAll("agent stopped");
+    void reopenAgentSession_allowsOnlyThatSessionToRunAgain() {
+        registry.associateAgentSession(AI_SESSION, AI_TRANSPORT);
+        registry.cancelAgentSession(AI_SESSION, "stopped by user");
+        registry.reopenAgentSession(AI_SESSION);
 
-        CompletableFuture<String> late = new CompletableFuture<>();
-        registry.register("late", late);
+        CompletableFuture<String> nextTurn = new CompletableFuture<>();
+        registry.register(AI_TRANSPORT, "next-turn", nextTurn);
 
-        assertTrue(late.isDone(), "Future registered after cancelAll must be immediately completed");
-        assertCancelledWith(late, "agent stopped");
+        assertFalse(nextTurn.isDone());
     }
 
     @Test
-    void cancelInFlight_completesRegisteredFutures_withCancellationException() {
-        CompletableFuture<String> a = new CompletableFuture<>();
-        registry.register("a", a);
+    void closeTransportSession_doesNotAffectAnotherTransport() {
+        CompletableFuture<String> closed = new CompletableFuture<>();
+        CompletableFuture<String> other = new CompletableFuture<>();
+        registry.register(AI_TRANSPORT, "closed", closed);
+        registry.register(EXTERNAL_TRANSPORT, "other", other);
 
-        registry.cancelInFlight("stopped by user");
+        registry.closeTransportSession(AI_TRANSPORT, "session closed");
 
-        assertCancelledWith(a, "stopped by user");
+        assertCancelledWith(closed, "session closed");
+        assertFalse(other.isDone());
     }
 
     @Test
-    void cancelInFlight_doesNotLatchClosed_soLaterRegistrationsProceed() {
-        registry.cancelInFlight("stopped by user");
+    void cancelAll_isReservedForServerLifecycle_andReopenAllAllowsRestart() {
+        CompletableFuture<String> beforeStop = new CompletableFuture<>();
+        registry.register(EXTERNAL_TRANSPORT, "before-stop", beforeStop);
 
-        // Unlike cancelAll, a transient turn-cancel must NOT auto-cancel a later registration —
-        // the next prompt's tool calls have to work without a reconnect.
-        CompletableFuture<String> later = new CompletableFuture<>();
-        registry.register("later", later);
+        registry.cancelAll("MCP server stopped");
+        assertCancelledWith(beforeStop, "MCP server stopped");
 
-        assertFalse(later.isDone(), "cancelInFlight must not latch the registry closed");
+        CompletableFuture<String> whileStopped = new CompletableFuture<>();
+        registry.register("http:new", "while-stopped", whileStopped);
+        assertCancelledWith(whileStopped, "MCP server stopped");
+
+        registry.reopenAll();
+        CompletableFuture<String> afterRestart = new CompletableFuture<>();
+        registry.register("http:new", "after-restart", afterRestart);
+        assertFalse(afterRestart.isDone());
     }
 
     @Test
-    void cancelInFlight_emptyRegistry_doesNotThrow() {
-        assertDoesNotThrow(() -> registry.cancelInFlight("test"));
+    void unregister_removesFuture() {
+        CompletableFuture<String> future = new CompletableFuture<>();
+        registry.register(AI_TRANSPORT, "future", future);
+        registry.unregister("future");
+
+        assertDoesNotThrow(() ->
+            registry.closeTransportSession(AI_TRANSPORT, "session closed"));
+        assertFalse(future.isDone());
     }
 
-    @Test
-    void cancelInFlight_interruptsRegisteredWorker() throws Exception {
-        assertWorkerInterruptedBy(() -> registry.cancelInFlight("stopped by user"));
-    }
-
-    @Test
-    void cancelAll_interruptsRegisteredWorker() throws Exception {
-        assertWorkerInterruptedBy(() -> registry.cancelAll("agent stopped"));
-    }
-
-    @Test
-    void registerWorker_afterCancelAll_immediatelyInterrupts() {
-        registry.cancelAll("agent stopped");
-        registry.registerWorker(Thread.currentThread());
-        // Thread.interrupted() also clears the flag so it does not leak into other tests.
-        assertTrue(Thread.interrupted(), "worker registered after cancelAll must be interrupted");
-    }
-
-    @Test
-    void reopen_afterCancelAll_allowsLaterFutureToProceed() {
-        registry.cancelAll("agent stopped");
-        registry.reopen();
-
-        CompletableFuture<String> later = new CompletableFuture<>();
-        registry.register("later", later);
-
-        assertFalse(later.isDone(),
-            "After reopen, a future registered for a new turn must not be auto-cancelled");
-    }
-
-    @Test
-    void reopen_afterCancelAll_allowsLaterWorkerToRunUninterrupted() {
-        registry.cancelAll("agent stopped");
-        registry.reopen();
-
-        registry.registerWorker(Thread.currentThread());
-
-        assertFalse(Thread.interrupted(),
-            "After reopen, a worker registered for a new turn must not be interrupted");
-    }
-
-    @Test
-    void reopen_whenAlreadyOpen_isNoOp() {
-        assertDoesNotThrow(registry::reopen);
-
-        CompletableFuture<String> later = new CompletableFuture<>();
-        registry.register("later", later);
-
-        assertFalse(later.isDone(), "reopen on an already-open registry must not affect registrations");
-    }
-
-    @Test
-    void registerWorker_afterCancelInFlight_doesNotInterrupt() {
-        registry.cancelInFlight("stopped by user");
-        registry.registerWorker(Thread.currentThread());
-        assertFalse(Thread.interrupted(),
-            "cancelInFlight must not latch — a worker registered afterward runs normally");
-    }
-
-    /**
-     * Spawns a worker that registers itself and blocks, then runs {@code cancelAction} and
-     * asserts the worker was interrupted and unblocked.
-     */
-    private void assertWorkerInterruptedBy(Runnable cancelAction) throws InterruptedException {
+    private WorkerProbe startWorker(String transportSessionKey, String name)
+        throws InterruptedException {
         CountDownLatch registered = new CountDownLatch(1);
         CountDownLatch finished = new CountDownLatch(1);
-        // Released only by an interrupt — the worker blocks here until the cancel interrupts it.
-        CountDownLatch blockUntilInterrupted = new CountDownLatch(1);
         AtomicBoolean interrupted = new AtomicBoolean(false);
         Thread worker = new Thread(() -> {
-            registry.registerWorker(Thread.currentThread());
+            registry.registerWorker(transportSessionKey, Thread.currentThread());
             registered.countDown();
             try {
-                blockUntilInterrupted.await();
+                new CountDownLatch(1).await();
             } catch (InterruptedException e) {
                 interrupted.set(true);
             } finally {
                 registry.unregisterWorker(Thread.currentThread());
                 finished.countDown();
             }
-        }, "test-tool-worker");
+        }, name);
         worker.start();
-        assertTrue(registered.await(2, TimeUnit.SECONDS), "worker did not register in time");
-
-        cancelAction.run();
-
-        assertTrue(finished.await(2, TimeUnit.SECONDS), "worker did not unblock after cancel");
-        assertTrue(interrupted.get(), "registered worker thread must be interrupted by the cancel");
+        assertTrue(registered.await(2, TimeUnit.SECONDS));
+        return new WorkerProbe(worker, finished, interrupted);
     }
 
-    private static void assertCancelledWith(CompletableFuture<String> future, String expectedReason) {
-        // CompletableFuture.completeExceptionally(CancellationException) makes get() throw
-        // CancellationException (not wrapped in ExecutionException). The thrown instance is a
-        // new "get"-message CancellationException whose cause is the original one we passed in.
-        CancellationException ce = assertThrows(CancellationException.class,
-            () -> future.get(1, TimeUnit.SECONDS),
-            "Future should complete exceptionally with CancellationException");
-        Throwable cause = ce.getCause();
-        String reason = cause != null ? cause.getMessage() : ce.getMessage();
-        assertEquals(expectedReason, reason);
+    private record WorkerProbe(
+        Thread thread,
+        CountDownLatch finished,
+        AtomicBoolean interrupted
+    ) {
+    }
+
+    private static void assertCancelledWith(
+        CompletableFuture<String> future,
+        String expectedReason
+    ) {
+        CancellationException exception = assertThrows(
+            CancellationException.class,
+            () -> future.get(1, TimeUnit.SECONDS));
+        Throwable cause = exception.getCause();
+        assertEquals(expectedReason, cause != null ? cause.getMessage() : exception.getMessage());
     }
 }

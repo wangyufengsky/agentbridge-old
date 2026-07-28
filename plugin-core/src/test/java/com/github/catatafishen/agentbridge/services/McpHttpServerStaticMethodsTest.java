@@ -194,7 +194,9 @@ class McpHttpServerStaticMethodsTest {
         void failedInitializeDoesNotPublishOrRetainSession() throws Exception {
             Project project = mock(Project.class);
             AgentTabTracker tracker = mock(AgentTabTracker.class);
+            InFlightMcpToolRegistry inFlightRegistry = mock(InFlightMcpToolRegistry.class);
             when(project.getService(AgentTabTracker.class)).thenReturn(tracker);
+            when(project.getService(InFlightMcpToolRegistry.class)).thenReturn(inFlightRegistry);
             McpHttpServer server = new McpHttpServer(project);
             Headers requestHeaders = new Headers();
             Headers responseHeaders = new Headers();
@@ -208,6 +210,8 @@ class McpHttpServerStaticMethodsTest {
                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602}}"));
             assertNull(responseHeaders.getFirst(McpHttpServer.MCP_SESSION_ID_HEADER));
             verify(tracker).closeOwnedTerminalTabs(resolution.ownerKey());
+            verify(inFlightRegistry).closeTransportSession(
+                resolution.ownerKey(), "MCP HTTP session closed");
 
             requestHeaders.set(McpHttpServer.MCP_SESSION_ID_HEADER, resolution.newSessionId());
             assertNull(server.resolveHttpOwner(exchange,
@@ -330,7 +334,9 @@ class McpHttpServerStaticMethodsTest {
         void deleteClosesOnlyTheSessionOwnerResources() throws Exception {
             Project project = mock(Project.class);
             AgentTabTracker tracker = mock(AgentTabTracker.class);
+            InFlightMcpToolRegistry inFlightRegistry = mock(InFlightMcpToolRegistry.class);
             when(project.getService(AgentTabTracker.class)).thenReturn(tracker);
+            when(project.getService(InFlightMcpToolRegistry.class)).thenReturn(inFlightRegistry);
             McpHttpServer server = new McpHttpServer(project);
             HttpExchange initialize = exchange(new Headers(), new Headers(),
                 new ByteArrayOutputStream());
@@ -349,6 +355,8 @@ class McpHttpServerStaticMethodsTest {
             invokePrivate(server, "handleMcp", new Class<?>[]{HttpExchange.class}, delete);
 
             verify(tracker).closeOwnedTerminalTabs(owner.ownerKey());
+            verify(inFlightRegistry).closeTransportSession(
+                owner.ownerKey(), "MCP HTTP session closed");
             verify(delete).sendResponseHeaders(204, -1);
             verify(delete).close();
         }
@@ -357,7 +365,9 @@ class McpHttpServerStaticMethodsTest {
         void requestCompletionReleasesResourcesWhenSessionClosedMidCall() throws Exception {
             Project project = mock(Project.class);
             AgentTabTracker tracker = mock(AgentTabTracker.class);
+            InFlightMcpToolRegistry inFlightRegistry = mock(InFlightMcpToolRegistry.class);
             when(project.getService(AgentTabTracker.class)).thenReturn(tracker);
+            when(project.getService(InFlightMcpToolRegistry.class)).thenReturn(inFlightRegistry);
             McpHttpServer server = new McpHttpServer(project);
             HttpExchange initialize = exchange(new Headers(), new Headers(),
                 new ByteArrayOutputStream());
@@ -412,7 +422,9 @@ class McpHttpServerStaticMethodsTest {
         void serverShutdownDrainsEveryHttpSessionOwner() throws Exception {
             Project project = mock(Project.class);
             AgentTabTracker tracker = mock(AgentTabTracker.class);
+            InFlightMcpToolRegistry inFlightRegistry = mock(InFlightMcpToolRegistry.class);
             when(project.getService(AgentTabTracker.class)).thenReturn(tracker);
+            when(project.getService(InFlightMcpToolRegistry.class)).thenReturn(inFlightRegistry);
             McpHttpServer server = new McpHttpServer(project);
             Headers requestHeaders = new Headers();
             HttpExchange exchange = exchange(requestHeaders, new Headers(),
@@ -428,6 +440,10 @@ class McpHttpServerStaticMethodsTest {
 
             verify(tracker).closeOwnedTerminalTabs(first.ownerKey());
             verify(tracker).closeOwnedTerminalTabs(second.ownerKey());
+            verify(inFlightRegistry).closeTransportSession(
+                first.ownerKey(), "MCP HTTP server stopped");
+            verify(inFlightRegistry).closeTransportSession(
+                second.ownerKey(), "MCP HTTP server stopped");
             requestHeaders.set(McpHttpServer.MCP_SESSION_ID_HEADER, first.newSessionId());
             assertNull(server.resolveHttpOwner(exchange,
                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"));

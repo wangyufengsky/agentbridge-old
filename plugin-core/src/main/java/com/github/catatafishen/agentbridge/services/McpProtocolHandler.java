@@ -675,7 +675,7 @@ public final class McpProtocolHandler {
             Thread worker = Thread.currentThread();
             workerThread.set(worker);
             McpCallContext.setCurrent(sessionKey);
-            registry.registerWorker(worker);
+            registry.registerWorker(sessionKey, worker);
             try {
                 return bridge.callTool(toolName, arguments, toolUseId, originalArguments);
             } finally {

@@ -211,8 +211,10 @@ final class McpSseTransport {
         SseSession session = sessions.remove(sessionId);
         if (session != null) {
             session.close();
-            AgentTabTracker.getInstance(project).closeOwnedTerminalTabs(
-                McpSessionRegistry.ownerKey("sse", sessionId));
+            String ownerKey = McpSessionRegistry.ownerKey("sse", sessionId);
+            InFlightMcpToolRegistry.getInstance(project)
+                .closeTransportSession(ownerKey, "MCP SSE session closed");
+            AgentTabTracker.getInstance(project).closeOwnedTerminalTabs(ownerKey);
             LOG.info("SSE session removed: " + sessionId);
         }
     }

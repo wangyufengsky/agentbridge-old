@@ -158,14 +158,6 @@ class PromptOrchestrator(
         // Clear any stale interrupt flag left by a previous stop() call so it doesn't fire
         // immediately on the first blocking operation in the new turn.
         Thread.interrupted()
-        // Re-open the in-flight registry in case a previous agent's stop() latched it closed via
-        // cancelAll (e.g. when switching clients or sessions). Without this, every tool call in the
-        // new turn would have its worker interrupted immediately, failing even read-only tools.
-        try {
-            InFlightMcpToolRegistry.getInstance(project).reopen()
-        } catch (_: Exception) {
-            // Best-effort
-        }
         currentPromptThread = Thread.currentThread()
         // Register a one-shot callback so the client notifies us if ACP messages arrive
         // after this turn ends (background sub-agent still running). Suppress it if the
@@ -204,14 +196,15 @@ class PromptOrchestrator(
                 // Best-effort cancellation
             }
         }
-        // Interrupt any in-flight MCP tool executions (e.g. a run_command child process or a
-        // prompt_user waiter) so they terminate immediately instead of running to completion
-        // after the turn is cancelled. Transient cancel: it does not latch the registry closed,
-        // so the next prompt's tool calls still work.
-        try {
-            InFlightMcpToolRegistry.getInstance(project).cancelInFlight("stopped by user")
-        } catch (_: Exception) {
-            // Best-effort
+        // Cancel only the MCP transport correlated with this AI session. External MCP clients
+        // share the project-level server but must not inherit this session's cancellation state.
+        if (sessionId != null) {
+            try {
+                InFlightMcpToolRegistry.getInstance(project)
+                    .cancelAgentSession(sessionId, "stopped by user")
+            } catch (_: Exception) {
+                // Best-effort
+            }
         }
         currentPromptThread?.interrupt()
         consolePanel().cancelAllRunning()
@@ -238,15 +231,13 @@ class PromptOrchestrator(
                 // Best-effort
             }
         }
-        // Interrupt any in-flight MCP tool executions spawned by the background sub-agent
-        // (e.g. run_command child processes, prompt_user waiters). Without this the remote
-        // agent is cancelled but local tool workers keep running until natural completion.
-        // Transient cancel: does not latch the registry closed, so the next prompt's tool
-        // calls still work.
-        try {
-            InFlightMcpToolRegistry.getInstance(project).cancelInFlight("stopped by user")
-        } catch (_: Exception) {
-            // Best-effort
+        if (sessionId != null) {
+            try {
+                InFlightMcpToolRegistry.getInstance(project)
+                    .cancelAgentSession(sessionId, "stopped by user")
+            } catch (_: Exception) {
+                // Best-effort
+            }
         }
         agentManager.client.clearPostTurnState()
         consolePanel().cancelAllRunning()
@@ -272,6 +263,9 @@ class PromptOrchestrator(
 
             val client = agentManager.client
             val sessionId = ensureSessionCreated(client)
+            // A user Stop latches cancellation only for this AI session so late tool calls cannot
+            // escape. Re-open that same session when its next turn begins.
+            InFlightMcpToolRegistry.getInstance(project).reopenAgentSession(sessionId)
             wirePermissionListener(client)
 
             val modelId = prepareModelAndTurnState(selectedModelId)
@@ -879,7 +873,7 @@ class PromptOrchestrator(
         // For Claude CLI, the ACP toolCallId IS the toolUseId that MCP sees in _meta.
         // Passing it enables Priority 0 correlation (exact ID match) in the tracker.
         return ToolCallTracker.getInstance(project).acpRegister(
-            toolCallId, acpName, title, argsObj, kind, routingType, toolCallId
+            toolCallId, acpName, title, argsObj, kind, routingType, toolCallId, currentSessionId
         )
     }
 

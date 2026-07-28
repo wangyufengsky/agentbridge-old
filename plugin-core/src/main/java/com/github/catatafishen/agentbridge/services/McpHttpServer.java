@@ -81,6 +81,7 @@ public final class McpHttpServer implements Disposable, McpServerControl {
             boolean isStatic = settings.isStaticPort();
             activeTransportMode = settings.getTransportMode();
 
+            InFlightMcpToolRegistry.getInstance(project).reopenAll();
             protocolHandler = new McpProtocolHandler(project);
 
             int actualPort = bindServerPort(port, isStatic);
@@ -179,6 +180,7 @@ public final class McpHttpServer implements Disposable, McpServerControl {
             }
             stopHttpSessionCleanup();
             closeAllHttpSessions();
+            InFlightMcpToolRegistry.getInstance(project).cancelAll("MCP server stopped");
             httpServer.stop(1);
             httpServer = null;
             if (requestExecutor != null) {
@@ -449,8 +451,10 @@ public final class McpHttpServer implements Disposable, McpServerControl {
 
     private boolean closeHttpSession(@NotNull String sessionId) {
         if (!httpSessions.closeSession(sessionId)) return false;
-        AgentTabTracker.getInstance(project).closeOwnedTerminalTabs(
-            McpSessionRegistry.ownerKey("http", sessionId));
+        String ownerKey = McpSessionRegistry.ownerKey("http", sessionId);
+        InFlightMcpToolRegistry.getInstance(project)
+            .closeTransportSession(ownerKey, "MCP HTTP session closed");
+        AgentTabTracker.getInstance(project).closeOwnedTerminalTabs(ownerKey);
         return true;
     }
 
@@ -482,8 +486,10 @@ public final class McpHttpServer implements Disposable, McpServerControl {
 
             AgentTabTracker tracker = AgentTabTracker.getInstance(project);
             for (String sessionId : expired) {
-                tracker.closeOwnedTerminalTabs(
-                    McpSessionRegistry.ownerKey("http", sessionId));
+                String ownerKey = McpSessionRegistry.ownerKey("http", sessionId);
+                InFlightMcpToolRegistry.getInstance(project)
+                    .closeTransportSession(ownerKey, "MCP HTTP session expired");
+                tracker.closeOwnedTerminalTabs(ownerKey);
             }
             LOG.info("Expired " + expired.size() + " idle MCP HTTP session(s)");
         } catch (RuntimeException e) {
@@ -534,8 +540,10 @@ public final class McpHttpServer implements Disposable, McpServerControl {
     private void closeAllHttpSessions() {
         AgentTabTracker tracker = AgentTabTracker.getInstance(project);
         for (String sessionId : httpSessions.drainSessions()) {
-            tracker.closeOwnedTerminalTabs(
-                McpSessionRegistry.ownerKey("http", sessionId));
+            String ownerKey = McpSessionRegistry.ownerKey("http", sessionId);
+            InFlightMcpToolRegistry.getInstance(project)
+                .closeTransportSession(ownerKey, "MCP HTTP server stopped");
+            tracker.closeOwnedTerminalTabs(ownerKey);
         }
     }
 

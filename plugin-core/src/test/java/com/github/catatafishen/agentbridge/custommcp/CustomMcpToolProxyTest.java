@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -135,6 +136,37 @@ class CustomMcpToolProxyTest {
     @Test
     void isOpenWorld_returnsTrue() {
         assertTrue(createProxy(TOOL_DESC, "").isOpenWorld());
+    }
+
+    @Test
+    void needsWriteLock_isAlwaysFalseForRemoteCustomMcpTools() {
+        assertFalse(createProxy(TOOL_DESC, "").needsWriteLock(),
+            "Remote MCP work must not occupy the IDE-global write semaphore");
+    }
+
+    @Test
+    void behaviorHints_arePropagatedFromRemoteAnnotations() {
+        JsonObject annotations = new JsonObject();
+        annotations.addProperty("readOnlyHint", true);
+        annotations.addProperty("destructiveHint", false);
+        annotations.addProperty("idempotentHint", true);
+        var toolInfo = new CustomMcpClient.ToolInfo(
+            "list_datasources", "List data sources", null, annotations);
+        var proxy = new CustomMcpToolProxy("db", NOOP_CALLER, toolInfo, "");
+
+        assertTrue(proxy.isReadOnly());
+        assertFalse(proxy.isDestructive());
+        assertTrue(proxy.isIdempotent());
+        assertFalse(proxy.needsWriteLock());
+    }
+
+    @Test
+    void missingBehaviorHints_remainConservativeWithoutTakingIdeWriteLock() {
+        var proxy = createProxy(TOOL_DESC, "");
+
+        assertFalse(proxy.isReadOnly());
+        assertFalse(proxy.isIdempotent());
+        assertFalse(proxy.needsWriteLock());
     }
 
     // ── Execute delegation ─────────────────────────────────
