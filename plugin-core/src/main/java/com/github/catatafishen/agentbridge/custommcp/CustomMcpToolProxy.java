@@ -21,6 +21,9 @@ public final class CustomMcpToolProxy implements ToolDefinition {
     @Nullable
     private final JsonObject inputSchema;
     private final McpToolCaller client;
+    private final boolean readOnly;
+    private final boolean destructive;
+    private final boolean idempotent;
 
     public CustomMcpToolProxy(
         @NotNull String serverPrefix,
@@ -33,6 +36,9 @@ public final class CustomMcpToolProxy implements ToolDefinition {
         this.displayName = toolInfo.name();
         this.inputSchema = toolInfo.inputSchema();
         this.client = client;
+        this.readOnly = annotation(toolInfo.annotations(), "readOnlyHint", false);
+        this.destructive = annotation(toolInfo.annotations(), "destructiveHint", false);
+        this.idempotent = annotation(toolInfo.annotations(), "idempotentHint", readOnly);
 
         String base = toolInfo.description();
         String safeInstructions = StringUtil.escapeXmlEntities(serverInstructions);
@@ -84,7 +90,44 @@ public final class CustomMcpToolProxy implements ToolDefinition {
     }
 
     @Override
+    public boolean isReadOnly() {
+        return readOnly;
+    }
+
+    /**
+     * Custom MCP calls execute in a remote server and do not mutate IntelliJ PSI directly.
+     * Their remote side-effect metadata still controls permissions, but they must never occupy
+     * the IDE-global write semaphore while waiting on network/database work.
+     */
+    @Override
+    public boolean needsWriteLock() {
+        return false;
+    }
+
+    @Override
+    public boolean isDestructive() {
+        return destructive;
+    }
+
+    @Override
+    public boolean isIdempotent() {
+        return idempotent;
+    }
+
+    @Override
     public @NotNull String execute(@NotNull JsonObject args) {
         return client.callTool(originalToolName, args);
+    }
+
+    private static boolean annotation(
+        @Nullable JsonObject annotations,
+        @NotNull String name,
+        boolean defaultValue
+    ) {
+        return annotations != null
+            && annotations.has(name)
+            && annotations.get(name).isJsonPrimitive()
+            ? annotations.get(name).getAsBoolean()
+            : defaultValue;
     }
 }

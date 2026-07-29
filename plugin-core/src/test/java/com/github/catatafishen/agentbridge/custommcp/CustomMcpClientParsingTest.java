@@ -44,6 +44,23 @@ class CustomMcpClientParsingTest {
         }
 
         @Test
+        void toolAnnotations_arePreserved() throws IOException {
+            JsonObject tool = tool(
+                "list_datasources", "List data sources", objectSchema("title", "string"));
+            JsonObject annotations = new JsonObject();
+            annotations.addProperty("readOnlyHint", true);
+            annotations.addProperty("idempotentHint", true);
+            tool.add("annotations", annotations);
+
+            CustomMcpClient.ToolInfo parsed =
+                CustomMcpClient.parseToolList(toolsListResponse(tool)).getFirst();
+
+            assertNotNull(parsed.annotations());
+            assertTrue(parsed.annotations().get("readOnlyHint").getAsBoolean());
+            assertTrue(parsed.annotations().get("idempotentHint").getAsBoolean());
+        }
+
+        @Test
         void multipleTools() throws IOException {
             JsonObject response = toolsListResponse(
                 tool("read_file", "Read a file", objectSchema("path", "string")),

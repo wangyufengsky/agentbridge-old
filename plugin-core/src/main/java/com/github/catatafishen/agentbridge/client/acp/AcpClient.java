@@ -378,6 +378,7 @@ public abstract class AcpClient extends AbstractClient {
 
     @Override
     public final void stop() {
+        String stoppedSessionId = currentSessionId;
         sendSessionCloseIfSupported();
         try {
             transport.stop();
@@ -400,17 +401,15 @@ public abstract class AcpClient extends AbstractClient {
             terminalHandler.releaseAll();
             loadedSessionHistory.set(null);
             updateConsumer.set(null);
-            // Release any in-flight MCP tools (e.g. prompt_user waiters) and mark their chips
-            // as failed so users see a clear failure state instead of a spinner that never
-            // resolves. See issue #749. The reason is intentionally neutral ("agent stopped")
-            // because stop() is called for both user-initiated disconnects and unexpected exits;
-            // we do not yet distinguish between the two here. If a future change adds an
-            // unexpected-exit detection path, it can call cancelAll/stopAllInFlight directly
-            // with a more specific reason before invoking stop().
-            if (project != null && !project.isDisposed()) {
+            // Release only work correlated with the AI session being stopped. The MCP registry
+            // is project-scoped and also serves unrelated external clients, so a project-wide
+            // cancellation latch here would interrupt their calls and poison their next request.
+            if (stoppedSessionId != null && project != null && !project.isDisposed()) {
                 try {
-                    InFlightMcpToolRegistry.getInstance(project).cancelAll("agent stopped");
-                    ToolCallTracker.getInstance(project).stopAllInFlight("agent stopped");
+                    InFlightMcpToolRegistry.getInstance(project)
+                        .cancelAgentSession(stoppedSessionId, "agent stopped");
+                    ToolCallTracker.getInstance(project)
+                        .stopAgentSession(stoppedSessionId, "agent stopped");
                 } catch (Exception e) {
                     LOG.warn("Failed to release in-flight tools on stop", e);
                 }

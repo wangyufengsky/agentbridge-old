@@ -94,8 +94,16 @@ public final class CustomMcpClient implements AutoCloseable, McpToolCaller {
     public record ToolInfo(
         @NotNull String name,
         @NotNull String description,
-        @Nullable JsonObject inputSchema
+        @Nullable JsonObject inputSchema,
+        @Nullable JsonObject annotations
     ) {
+        public ToolInfo(
+            @NotNull String name,
+            @NotNull String description,
+            @Nullable JsonObject inputSchema
+        ) {
+            this(name, description, inputSchema, null);
+        }
     }
 
     /**
@@ -424,8 +432,10 @@ public final class CustomMcpClient implements AutoCloseable, McpToolCaller {
             String name = toolObj.has("name") ? toolObj.get("name").getAsString() : "";
             String desc = toolObj.has("description") ? toolObj.get("description").getAsString() : "";
             JsonObject schema = toolObj.has("inputSchema") ? toolObj.getAsJsonObject("inputSchema") : null;
+            JsonObject annotations = toolObj.has("annotations") && toolObj.get("annotations").isJsonObject()
+                ? toolObj.getAsJsonObject("annotations") : null;
             if (!name.isEmpty()) {
-                tools.add(new ToolInfo(name, desc, schema));
+                tools.add(new ToolInfo(name, desc, schema, annotations));
             }
         }
         return tools;

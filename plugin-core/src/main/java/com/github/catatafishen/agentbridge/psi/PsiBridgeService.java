@@ -3,6 +3,7 @@ package com.github.catatafishen.agentbridge.psi;
 import com.github.catatafishen.agentbridge.psi.tools.project.ExternalDirRegistry;
 import com.github.catatafishen.agentbridge.services.ActiveAgentManager;
 import com.github.catatafishen.agentbridge.services.AgentNudgeService;
+import com.github.catatafishen.agentbridge.services.McpCallContext;
 import com.github.catatafishen.agentbridge.services.ToolCallRecord;
 import com.github.catatafishen.agentbridge.services.ToolCallTracker;
 import com.github.catatafishen.agentbridge.services.ToolDefinition;
@@ -436,7 +437,12 @@ public final class PsiBridgeService implements Disposable {
         long preWriteStamp = getDocumentStamp(vfForHighlights);
 
         ToolCallTracker tracker = ToolCallTracker.getInstance(project);
-        ToolCallRecord callRecord = tracker.mcpRegister(req.toolName(), req.chipArgs(), req.def().kind().value(), req.toolUseId());
+        ToolCallRecord callRecord = tracker.mcpRegister(
+            req.toolName(),
+            req.chipArgs(),
+            req.def().kind().value(),
+            req.toolUseId(),
+            McpCallContext.currentOrFallback());
 
         try (DaemonWaiter daemonWaiter = filePathForHighlights != null
             ? new DaemonWaiter(project, vfForHighlights, preWriteStamp) : null) {

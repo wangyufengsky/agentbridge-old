@@ -35,7 +35,9 @@ class McpSseTransportTest {
     void stopClosesSessionsAndTheirOwnedTerminalResources() throws Exception {
         Project project = mock(Project.class);
         AgentTabTracker tracker = mock(AgentTabTracker.class);
+        InFlightMcpToolRegistry inFlightRegistry = mock(InFlightMcpToolRegistry.class);
         when(project.getService(AgentTabTracker.class)).thenReturn(tracker);
+        when(project.getService(InFlightMcpToolRegistry.class)).thenReturn(inFlightRegistry);
         McpSseTransport transport = new McpSseTransport(
             project, mock(McpProtocolHandler.class));
         transport.start();
@@ -50,6 +52,9 @@ class McpSseTransportTest {
         assertEquals(0, transport.getActiveSessionCount());
         verify(tracker).closeOwnedTerminalTabs(
             McpSessionRegistry.ownerKey("sse", session.getSessionId()));
+        verify(inFlightRegistry).closeTransportSession(
+            McpSessionRegistry.ownerKey("sse", session.getSessionId()),
+            "MCP SSE session closed");
         verify(exchange).close();
     }
 

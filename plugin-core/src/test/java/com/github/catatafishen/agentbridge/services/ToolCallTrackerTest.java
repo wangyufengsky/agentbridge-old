@@ -652,4 +652,18 @@ class ToolCallTrackerTest {
             ToolCallRecord.RoutingType.REGULAR, null);
         assertNull(rec.getKind());
     }
+
+    @Test
+    void stopAgentSession_preservesExternalMcpRecords() {
+        ToolCallRecord ai = tracker.acpRegister(
+            "acp-ai", null, "read_file", argsReadFile("/ai"), null,
+            ToolCallRecord.RoutingType.REGULAR, null, "agent-session-1");
+        ToolCallRecord external = tracker.mcpRegister(
+            "list_datasources", args("title", "list"), null, null);
+
+        tracker.stopAgentSession("agent-session-1", "agent stopped");
+
+        assertNull(tracker.findByRecordId(ai.getRecordId()));
+        assertSame(external, tracker.findByRecordId(external.getRecordId()));
+    }
 }
