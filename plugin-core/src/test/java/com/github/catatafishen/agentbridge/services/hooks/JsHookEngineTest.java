@@ -4,6 +4,8 @@ import com.google.gson.JsonObject;
 import com.intellij.openapi.project.Project;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
 
 import java.io.IOException;
@@ -111,6 +113,40 @@ class JsHookEngineTest {
         assertEquals("", run(dir, "run-command-abuse.js", command("run_command", "grep -r foo .")));
     }
 
+    @Test
+    void runCommandAllowsGitMentionedInsideAnArgument(@TempDir Path dir) throws IOException {
+        // Regression: the word "git" in prose passed as an argument is not a git invocation.
+        assertEquals("", run(dir, "run-command-abuse.js", command("run_command",
+            "gh pr comment 913 --body \"Resolved via Git Bash / WSL; run git status yourself\"")));
+    }
+
+    @Test
+    void runCommandAllowsGitAsPartOfAnotherWord(@TempDir Path dir) throws IOException {
+        assertEquals("", run(dir, "run-command-abuse.js", command("run_command", "echo digital-github")));
+    }
+
+    /**
+     * All three forms hide the git invocation from a naive prefix check — later in a pipeline,
+     * inside a command substitution, and behind an environment-setting wrapper.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {
+        "echo hi && git push",
+        "echo $(git rev-parse HEAD)",
+        "env GIT_PAGER=cat git log"
+    })
+    void runCommandDeniesGitHiddenInTheCommand(String commandLine, @TempDir Path dir) throws IOException {
+        String json = run(dir, "run-command-abuse.js", command("run_command", commandLine));
+        assertTrue(json.contains("\"decision\":\"deny\""), json);
+    }
+
+    @Test
+    void runCommandAllowsRedirectionMentionedInsideAnArgument(@TempDir Path dir) throws IOException {
+        // The ">" inside the quoted body is text, not a redirection into a source file.
+        assertEquals("", run(dir, "run-command-abuse.js", command("run_command",
+            "echo \"append output > Main.java to reproduce\"")));
+    }
+
     // ---- run-in-terminal-abort.js (permission) ----
 
     @Test
@@ -123,6 +159,12 @@ class JsHookEngineTest {
     @Test
     void terminalAllowsListing(@TempDir Path dir) throws IOException {
         assertEquals("", run(dir, "run-in-terminal-abort.js", command("run_in_terminal", "ls -la")));
+    }
+
+    @Test
+    void terminalAllowsGitMentionedInsideAnArgument(@TempDir Path dir) throws IOException {
+        assertEquals("", run(dir, "run-in-terminal-abort.js", command("run_in_terminal",
+            "echo 'the git tools are preferred here'")));
     }
 
     // ---- command-reprimand.js (success) ----
@@ -148,6 +190,19 @@ class JsHookEngineTest {
     @Test
     void reprimandSilentForPlainCommand(@TempDir Path dir) throws IOException {
         assertEquals("", run(dir, "command-reprimand.js", commandResult("echo hi", "hi", false)));
+    }
+
+    @Test
+    void reprimandSilentWhenToolNameOnlyAppearsInAnArgument(@TempDir Path dir) throws IOException {
+        // Regression: mentioning grep/cat/ls in prose must not trigger a nudge.
+        assertEquals("", run(dir, "command-reprimand.js",
+            commandResult("gh pr create --body \"use grep and cat to inspect the ls output\"", "out", false)));
+    }
+
+    @Test
+    void reprimandNudgesGrepLaterInPipeline(@TempDir Path dir) throws IOException {
+        String json = run(dir, "command-reprimand.js", commandResult("printf x | grep y", "out", false));
+        assertTrue(json.contains("search_text"), json);
     }
 
     // ---- check-stale-naming.js (success) ----

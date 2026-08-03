@@ -4,6 +4,7 @@ import com.github.catatafishen.agentbridge.psi.ClassResolverUtil;
 import com.github.catatafishen.agentbridge.psi.EdtUtil;
 import com.github.catatafishen.agentbridge.psi.PlatformApiCompat;
 import com.github.catatafishen.agentbridge.psi.ToolUtils;
+import com.github.catatafishen.agentbridge.psi.tools.McpRequestDeadline;
 import com.github.catatafishen.agentbridge.psi.tools.RunPanelExecutor;
 import com.github.catatafishen.agentbridge.ui.renderers.TestResultRenderer;
 import com.google.gson.JsonObject;
@@ -44,6 +45,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -67,17 +69,22 @@ public final class RunTestsTool extends TestingTool {
     private static final String TEST_TYPE_PATTERN = "pattern";
     private static final String JUNIT_TYPE_ID = "junit";
     private static final String LAUNCH_FAILED = "launch_failed";
-    private static final String NO_PROCESS_HANDLE_MSG =
-        "\nCould not capture process handle. Check the Run panel for results.";
     private static final String FIELD_TEST_OBJECT = "TEST_OBJECT";
     private static final String ERROR_PROCESS_FAILED_TO_START = "Error: Test process failed to start for ";
-    private static final String STARTED_TESTS_MSG = "Started tests via IntelliJ JUnit runner: ";
     private static final String ERROR_NO_PROJECT_PATH = "Error: Could not determine project base path";
+
+    /**
+     * Default wait for a test run, in seconds. Kept below
+     * {@link McpRequestDeadline#MAX_TIMEOUT_SECONDS} — the previous default of 300s could never be
+     * honoured, since the MCP client abandons the request long before then and the agent would see
+     * a transport error rather than the test results.
+     */
+    private static final int DEFAULT_TIMEOUT_SECONDS = 150;
 
     /**
      * Timeout in seconds for {@link #awaitProcessTermination}; set in {@link #execute}.
      */
-    private int timeoutSec = 300;
+    private int timeoutSec = DEFAULT_TIMEOUT_SECONDS;
 
     public RunTestsTool(Project project) {
         super(project);
@@ -100,7 +107,8 @@ public final class RunTestsTool extends TestingTool {
             "Falls back to the project's build tool for unresolvable targets; use the 'test_task' parameter " +
             "when the project defines a custom test task (e.g., 'unitTest') instead of the standard 'test'. " +
             "Returns pass/fail counts and failure details. Use list_tests to discover available test targets. " +
-            "Use the 'timeout' parameter to override the default 300-second wait.";
+            "Use the 'timeout' parameter to override the default " + DEFAULT_TIMEOUT_SECONDS
+            + "-second wait, up to a maximum of " + McpRequestDeadline.MAX_TIMEOUT_SECONDS + "s.";
     }
 
     @Override
@@ -126,7 +134,12 @@ public final class RunTestsTool extends TestingTool {
             Param.optional(PARAM_TEST_TASK, TYPE_STRING,
                 "Build task name when the project does not use the standard 'test' task "
                     + "(e.g., 'unitTest'). Auto-detected from the project model if not specified.", ""),
-            Param.optional(PARAM_TIMEOUT, TYPE_INTEGER, "Timeout in seconds (default: 300)")
+            Param.optional(PARAM_TIMEOUT, TYPE_INTEGER,
+                "Timeout in seconds (default: " + DEFAULT_TIMEOUT_SECONDS + ", maximum: "
+                    + McpRequestDeadline.MAX_TIMEOUT_SECONDS + "). Larger values are reduced to the "
+                    + "maximum, because MCP clients abandon a request after roughly 180s and the "
+                    + "results would be lost. For a suite that needs longer, run it with "
+                    + "run_in_terminal and poll with read_terminal_output.")
         );
     }
 
@@ -137,13 +150,19 @@ public final class RunTestsTool extends TestingTool {
 
     @Override
     public @NotNull String execute(@NotNull JsonObject args) throws Exception {
+        int requestedTimeout = args.has(PARAM_TIMEOUT)
+            ? args.get(PARAM_TIMEOUT).getAsInt() : DEFAULT_TIMEOUT_SECONDS;
+        String timeoutError = McpRequestDeadline.rejectNonPositive(requestedTimeout);
+        if (timeoutError != null) return timeoutError;
+        this.timeoutSec = McpRequestDeadline.clamp(requestedTimeout);
+        return McpRequestDeadline.prependNotice(
+            McpRequestDeadline.clampNotice(requestedTimeout), runResolvedTarget(args));
+    }
+
+    private @NotNull String runResolvedTarget(@NotNull JsonObject args) {
         String target = args.get(PARAM_TARGET).getAsString();
         String module = args.has(JSON_MODULE) ? args.get(JSON_MODULE).getAsString() : "";
         String testTask = args.has(PARAM_TEST_TASK) ? args.get(PARAM_TEST_TASK).getAsString() : "";
-        this.timeoutSec = args.has(PARAM_TIMEOUT) ? args.get(PARAM_TIMEOUT).getAsInt() : 300;
-        if (this.timeoutSec <= 0) {
-            return "Error: timeout must be a positive integer (seconds), got: " + this.timeoutSec;
-        }
         String basePath = project.getBasePath();
         if (basePath == null) return ERROR_NO_PROJECT_PATH;
 
@@ -286,10 +305,7 @@ public final class RunTestsTool extends TestingTool {
     private String runTestConfigAndWait(RunnerAndConfigurationSettings settings) throws Exception {
         String configName = settings.getName();
 
-        CompletableFuture<ProcessHandler> handlerFuture = new CompletableFuture<>();
-        AtomicReference<Runnable> disconnect = new AtomicReference<>(() -> {
-        });
-        disconnect.set(subscribeToExecution(configName, handlerFuture, disconnect));
+        TestExecutionTracker tracker = new TestExecutionTracker(project, configName);
 
         CompletableFuture<String> launchFuture = new CompletableFuture<>();
         EdtUtil.invokeLater(() -> {
@@ -297,9 +313,10 @@ public final class RunTestsTool extends TestingTool {
                 var executor = DefaultRunExecutor.getRunExecutorInstance();
                 var envBuilder = ExecutionEnvironmentBuilder.createOrNull(executor, settings);
                 if (envBuilder == null) {
-                    launchFuture.complete("Cannot create execution environment for: " + configName);
+                    launchFuture.complete(err("Cannot create execution environment for: " + configName));
                     return;
                 }
+                tracker.expect(settings.getConfiguration());
                 ExecutionManager.getInstance(project).restartRunProfile(envBuilder.build());
                 launchFuture.complete(null);
             } catch (Exception e) {
@@ -308,7 +325,7 @@ public final class RunTestsTool extends TestingTool {
             }
         });
 
-        return awaitTestExecution(configName, launchFuture, handlerFuture, disconnect);
+        return awaitTestExecution(configName, launchFuture, tracker);
     }
 
     // ── Native JUnit runner ──────────────────────────────────
@@ -330,16 +347,13 @@ public final class RunTestsTool extends TestingTool {
             String simpleName = resolvedClass.substring(resolvedClass.lastIndexOf('.') + 1);
             String configName = buildJUnitConfigName(simpleName, testMethod);
 
-            CompletableFuture<ProcessHandler> handlerFuture = new CompletableFuture<>();
-            AtomicReference<Runnable> disconnect = new AtomicReference<>(() -> {
-            });
-            disconnect.set(subscribeToExecution(configName, handlerFuture, disconnect));
+            TestExecutionTracker tracker = new TestExecutionTracker(project, configName);
 
             CompletableFuture<String> launchFuture = new CompletableFuture<>();
             EdtUtil.invokeLater(() -> {
                 try {
                     String error = launchJUnitConfig(
-                        junitType, resolvedClass, testMethod, resolvedModule, configName);
+                        junitType, resolvedClass, testMethod, resolvedModule, configName, tracker);
                     launchFuture.complete(error);
                 } catch (Exception e) {
                     LOG.warn("Failed to run JUnit natively, will fall back to Gradle", e);
@@ -347,7 +361,7 @@ public final class RunTestsTool extends TestingTool {
                 }
             });
 
-            return awaitTestExecution(configName, launchFuture, handlerFuture, disconnect);
+            return awaitTestExecution(configName, launchFuture, tracker);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             LOG.warn("tryRunJUnitNatively failed", e);
@@ -370,16 +384,13 @@ public final class RunTestsTool extends TestingTool {
 
             String configName = buildPatternConfigName(target, matchingClasses.size());
 
-            CompletableFuture<ProcessHandler> handlerFuture = new CompletableFuture<>();
-            AtomicReference<Runnable> disconnect = new AtomicReference<>(() -> {
-            });
-            disconnect.set(subscribeToExecution(configName, handlerFuture, disconnect));
+            TestExecutionTracker tracker = new TestExecutionTracker(project, configName);
 
             CompletableFuture<String> launchFuture = new CompletableFuture<>();
             EdtUtil.invokeLater(() -> launchPatternConfig(
-                junitType, configName, matchingClasses, launchFuture));
+                junitType, configName, matchingClasses, launchFuture, tracker));
 
-            return awaitTestExecution(configName, launchFuture, handlerFuture, disconnect);
+            return awaitTestExecution(configName, launchFuture, tracker);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             LOG.warn("tryRunJUnitPattern failed", e);
@@ -420,7 +431,8 @@ public final class RunTestsTool extends TestingTool {
     // Required: accessing internal JUnit run config fields via reflection — no public API exists
     private void launchPatternConfig(ConfigurationType junitType, String configName,
                                      List<String> matchingClasses,
-                                     CompletableFuture<String> launchFuture) {
+                                     CompletableFuture<String> launchFuture,
+                                     TestExecutionTracker tracker) {
         try {
             RunManager runManager = RunManager.getInstance(project);
             var factory = junitType.getConfigurationFactories()[0];
@@ -453,6 +465,7 @@ public final class RunTestsTool extends TestingTool {
                 launchFuture.complete("Error: Cannot create execution environment");
                 return;
             }
+            tracker.expect(config);
             ExecutionManager.getInstance(project).restartRunProfile(envBuilder.build());
             launchFuture.complete(null);
         } catch (Exception e) {
@@ -489,15 +502,13 @@ public final class RunTestsTool extends TestingTool {
             String resolvedTask = testTask.isEmpty() ? resolveTestTask() : testTask;
             String configName = "Gradle Test: " + target;
 
-            CompletableFuture<ProcessHandler> handlerFuture = new CompletableFuture<>();
-            AtomicReference<Runnable> disconnect = new AtomicReference<>(() -> {
-            });
-            disconnect.set(subscribeToExecution(configName, handlerFuture, disconnect));
+            TestExecutionTracker tracker = new TestExecutionTracker(project, configName);
 
             CompletableFuture<String> launchFuture = new CompletableFuture<>();
             EdtUtil.invokeLater(() -> {
                 try {
-                    String error = createAndRunGradleTestConfig(configName, taskPrefix, target, resolvedTask);
+                    String error = createAndRunGradleTestConfig(
+                        configName, taskPrefix, target, resolvedTask, tracker);
                     launchFuture.complete(error);
                 } catch (Exception e) {
                     LOG.warn("Failed to create Gradle test config", e);
@@ -505,8 +516,7 @@ public final class RunTestsTool extends TestingTool {
                 }
             });
 
-            return awaitGradleTestExecution(
-                configName, launchFuture, handlerFuture, disconnect, target, module);
+            return awaitGradleTestExecution(configName, launchFuture, tracker, target, module);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return "Error: Test execution interrupted";
@@ -516,7 +526,8 @@ public final class RunTestsTool extends TestingTool {
         }
     }
 
-    private String createAndRunGradleTestConfig(String configName, String taskPrefix, String target, String gradleTask) {
+    private String createAndRunGradleTestConfig(String configName, String taskPrefix, String target,
+                                                String gradleTask, TestExecutionTracker tracker) {
         try {
             RunManager runManager = RunManager.getInstance(project);
 
@@ -557,6 +568,7 @@ public final class RunTestsTool extends TestingTool {
                 return "Error: Cannot create execution environment for Gradle test";
             }
 
+            tracker.expect(config);
             ExecutionManager.getInstance(project).restartRunProfile(envBuilder.build());
             return null;
         } catch (Exception e) {
@@ -615,7 +627,7 @@ public final class RunTestsTool extends TestingTool {
     }
 
     public String executeFromCommand(@NotNull String command) {
-        return executeFromCommand(command, 300);
+        return executeFromCommand(command, DEFAULT_TIMEOUT_SECONDS);
     }
 
     public String executeFromCommand(@NotNull String command, int timeoutSec) {
@@ -653,50 +665,51 @@ public final class RunTestsTool extends TestingTool {
 
     // ── Execution lifecycle helpers ──────────────────────────
 
-    private Runnable subscribeToExecution(String configName,
-                                          CompletableFuture<ProcessHandler> handlerFuture,
-                                          AtomicReference<Runnable> disconnect) {
-        return PlatformApiCompat.subscribeExecutionListener(project, new com.intellij.execution.ExecutionListener() {
-            @Override
-            public void processStarted(@NotNull String executorId,
-                                       @NotNull com.intellij.execution.runners.ExecutionEnvironment env,
-                                       @NotNull ProcessHandler handler) {
-                if (env.getRunnerAndConfigurationSettings() != null
-                    && configName.equals(env.getRunnerAndConfigurationSettings().getName())) {
-                    handlerFuture.complete(handler);
-                    disconnect.get().run();
-                }
-            }
+    /**
+     * Grace period for the platform to report the launched process, capped by the caller's own
+     * timeout. A cold Gradle daemon routinely needs more than a few seconds to hand over a process
+     * handle, and giving up early made {@code run_tests} return before the tests had even started.
+     */
+    private static final int HANDLER_WAIT_SECONDS = 60;
 
-            @Override
-            public void processNotStarted(@NotNull String executorId,
-                                          @NotNull com.intellij.execution.runners.ExecutionEnvironment env) {
-                if (env.getRunnerAndConfigurationSettings() != null
-                    && configName.equals(env.getRunnerAndConfigurationSettings().getName())) {
-                    handlerFuture.complete(null);
-                    disconnect.get().run();
-                }
-            }
-        });
+    private long handlerWaitSeconds() {
+        return handlerWaitSeconds(timeoutSec);
+    }
+
+    /**
+     * Never waits longer for the process handle than the caller was prepared to wait for the whole
+     * run, so a short {@code timeout} still returns promptly.
+     */
+    static long handlerWaitSeconds(int timeoutSeconds) {
+        return Math.clamp(timeoutSeconds, 1, HANDLER_WAIT_SECONDS);
+    }
+
+    private String noProcessHandleError(String configName) {
+        return "Error: Tests were launched as '" + configName + "' but the IDE did not report a "
+            + "process handle within " + handlerWaitSeconds() + "s, so the result could not be "
+            + "collected. The run is probably still in progress — use list_run_tabs to find the tab "
+            + "and read_run_output to read the outcome.";
     }
 
     private String awaitTestExecution(String configName,
                                       CompletableFuture<String> launchFuture,
-                                      CompletableFuture<ProcessHandler> handlerFuture,
-                                      AtomicReference<Runnable> disconnect) throws Exception {
+                                      TestExecutionTracker tracker) throws Exception {
         String launchError = launchFuture.get(10, TimeUnit.SECONDS);
         if (launchError != null) {
-            disconnect.get().run();
+            tracker.disconnect();
             return LAUNCH_FAILED.equals(launchError) ? null : launchError;
         }
 
         ProcessHandler handler;
         try {
-            handler = handlerFuture.get(15, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
-            disconnect.get().run();
-            return STARTED_TESTS_MSG + configName + NO_PROCESS_HANDLE_MSG;
+            handler = tracker.awaitHandler(handlerWaitSeconds());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            tracker.disconnect();
+            return noProcessHandleError(configName);
+        } catch (TimeoutException e) {
+            tracker.disconnect();
+            return noProcessHandleError(configName);
         }
 
         if (handler == null) return ERROR_PROCESS_FAILED_TO_START + configName;
@@ -709,12 +722,11 @@ public final class RunTestsTool extends TestingTool {
 
     private String awaitGradleTestExecution(String configName,
                                             CompletableFuture<String> launchFuture,
-                                            CompletableFuture<ProcessHandler> handlerFuture,
-                                            AtomicReference<Runnable> disconnect,
+                                            TestExecutionTracker tracker,
                                             String target, String module) throws Exception {
         String launchError = launchFuture.get(10, TimeUnit.SECONDS);
         if (launchError != null) {
-            disconnect.get().run();
+            tracker.disconnect();
             if (LAUNCH_FAILED.equals(launchError)) {
                 return "Error: Failed to create Gradle test run configuration for: " + target;
             }
@@ -723,11 +735,14 @@ public final class RunTestsTool extends TestingTool {
 
         ProcessHandler handler;
         try {
-            handler = handlerFuture.get(15, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
-            disconnect.get().run();
-            return "Started tests via Gradle run configuration: " + configName + NO_PROCESS_HANDLE_MSG;
+            handler = tracker.awaitHandler(handlerWaitSeconds());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            tracker.disconnect();
+            return noProcessHandleError(configName);
+        } catch (TimeoutException e) {
+            tracker.disconnect();
+            return noProcessHandleError(configName);
         }
 
         if (handler == null) return ERROR_PROCESS_FAILED_TO_START + configName;
@@ -814,7 +829,7 @@ public final class RunTestsTool extends TestingTool {
     private String launchJUnitConfig(
         ConfigurationType junitType,
         String resolvedClass, String resolvedMethod, Module resolvedModule,
-        String configName) throws Exception {
+        String configName, TestExecutionTracker tracker) throws Exception {
         RunManager runManager = RunManager.getInstance(project);
         var factory = junitType.getConfigurationFactories()[0];
         var settings = runManager.createConfiguration(configName, factory);
@@ -838,6 +853,7 @@ public final class RunTestsTool extends TestingTool {
         }
 
         var env = envBuilder.build();
+        tracker.expect(config);
         ExecutionManager.getInstance(project).restartRunProfile(env);
         return null;
     }

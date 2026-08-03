@@ -538,8 +538,16 @@ public final class McpHttpServer implements Disposable, McpServerControl {
     }
 
     private void closeAllHttpSessions() {
-        AgentTabTracker tracker = AgentTabTracker.getInstance(project);
-        for (String sessionId : httpSessions.drainSessions()) {
+        // Use getServiceIfCreated so we do not force-instantiate AgentTabTracker during
+        // project dispose. If the tracker was never created, no terminal tabs were ever
+        // registered as owned by an MCP session, so there is nothing to close. Requesting
+        // the service via getService() during dispose fails with IncorrectOperationException
+        // ("services of ProjectImpl has already been disposed").
+        var drained = httpSessions.drainSessions();
+        if (drained.isEmpty()) return;
+        AgentTabTracker tracker = project.getServiceIfCreated(AgentTabTracker.class);
+        if (tracker == null) return;
+        for (String sessionId : drained) {
             String ownerKey = McpSessionRegistry.ownerKey("http", sessionId);
             InFlightMcpToolRegistry.getInstance(project)
                 .closeTransportSession(ownerKey, "MCP HTTP server stopped");
