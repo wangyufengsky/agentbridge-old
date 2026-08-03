@@ -31,6 +31,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class ChatWebServerTest {
 
+    /**
+     * Class-scoped classpath directory for {@link FakeProcess}, populated lazily by
+     * {@link #fakeProcessClasspath()}. JUnit creates it before the first test and recursively
+     * deletes the whole tree afterwards, so no manual cleanup registration is needed.
+     */
+    @TempDir
+    static Path fakeProcessClasspathDir;
+
     // ── buildStreamingPrefix ──────────────────────────────────────────────────
 
     @Test
@@ -410,14 +418,47 @@ class ChatWebServerTest {
         throw new AssertionError("Expected fake command to fail");
     }
 
-    private static String[] fakeProcessCommand(String mode) {
+    private static String[] fakeProcessCommand(String mode) throws IOException {
         return new String[]{
             javaExecutable(),
             "-cp",
-            System.getProperty("java.class.path"),
+            fakeProcessClasspath(),
             FakeProcess.class.getName(),
             mode
         };
+    }
+
+    /**
+     * Return a short classpath containing only {@link FakeProcess}, not the entire test JVM classpath.
+     * Under IntelliJ Platform Gradle Plugin 2.18.1 the test IDE classpath contains 500+ entries
+     * (~66 kB) which exceeds POSIX {@code ARG_MAX} and causes {@code exec()} to fail with
+     * "Argument list too long". {@code FakeProcess} only uses JDK classes, so extracting just
+     * its class file to a temp directory is sufficient.
+     *
+     * <p>We cannot use {@code FakeProcess.class.getProtectionDomain().getCodeSource()} because
+     * {@code com.intellij.util.lang.PathClassLoader} (the test IDE classloader) does not populate
+     * the {@code CodeSource}.
+     *
+     * <p>The class file is extracted once into {@link #fakeProcessClasspathDir} and reused by
+     * later callers. Cleanup is left to JUnit's {@link TempDir} support, which removes the
+     * directory tree recursively. {@code File.deleteOnExit()} is deliberately not used here: it
+     * deletes in reverse registration order and never removes a non-empty directory, so the
+     * intermediate package directories under the root would survive and keep the root undeletable.
+     */
+    private static String fakeProcessClasspath() throws IOException {
+        String resourcePath = FakeProcess.class.getName().replace('.', '/') + ".class";
+        Path classFile = fakeProcessClasspathDir.resolve(resourcePath);
+        if (Files.exists(classFile)) {
+            return fakeProcessClasspathDir.toString();
+        }
+        Files.createDirectories(classFile.getParent());
+        try (InputStream in = FakeProcess.class.getClassLoader().getResourceAsStream(resourcePath)) {
+            if (in == null) {
+                throw new IOException("Cannot load " + resourcePath + " from classpath");
+            }
+            Files.copy(in, classFile);
+        }
+        return fakeProcessClasspathDir.toString();
     }
 
     private static String javaExecutable() {
