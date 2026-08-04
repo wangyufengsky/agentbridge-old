@@ -132,6 +132,7 @@ public final class ChatWebServer implements Disposable {
     private volatile String currentModel = "";
     private volatile String projectName = "";
     private volatile boolean agentRunning = false;
+    private final PromptAdmissionGate promptAdmissionGate = new PromptAdmissionGate();
     private volatile boolean connected = false;
     private volatile String modelsJson = "[]";
     private volatile String profilesJson = "[]";
@@ -429,10 +430,7 @@ public final class ChatWebServer implements Disposable {
         server.createContext("/state", this::handleState);
         server.createContext("/catch-up", this::handleCatchUp);
         server.createContext("/info", this::handleInfo);
-        server.createContext("/prompt", ex -> handleAction(ex, body -> {
-            String text = jsonString(body, "text");
-            if (text != null && !text.isEmpty() && onSendPrompt != null) onSendPrompt.accept(text);
-        }));
+        server.createContext("/prompt", this::handlePrompt);
         server.createContext("/reply", ex -> handleAction(ex, body -> {
             String text = jsonString(body, "text");
             if (text != null && !text.isEmpty() && onQuickReply != null) onQuickReply.accept(text);
@@ -638,6 +636,7 @@ public final class ChatWebServer implements Disposable {
 
     public void setAgentRunning(boolean running) {
         agentRunning = running;
+        promptAdmissionGate.setBusy(running);
     }
 
     // ── TLS ───────────────────────────────────────────────────────────────────
@@ -1536,6 +1535,72 @@ public final class ChatWebServer implements Disposable {
         sendJson(exchange, buildInfoJson());
     }
 
+    private void handlePrompt(HttpExchange exchange) throws IOException {
+        exchange.getResponseHeaders().set(HDR_ACCESS_CONTROL_ORIGIN, "*");
+        exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "POST, OPTIONS");
+        exchange.getResponseHeaders().set("Access-Control-Allow-Headers", HDR_CONTENT_TYPE);
+
+        if ("OPTIONS".equals(exchange.getRequestMethod())) {
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+            return;
+        }
+        if (!"POST".equals(exchange.getRequestMethod())) {
+            exchange.sendResponseHeaders(405, -1);
+            exchange.close();
+            return;
+        }
+
+        boolean reserved = false;
+        boolean localSessionCommand = false;
+        boolean accepted = false;
+        try {
+            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            String text = jsonString(body, "text");
+            if (text == null || text.isBlank()) {
+                sendJson(exchange, 400, "{\"error\":\"prompt_required\"}");
+                return;
+            }
+            if (!promptAdmissionGate.tryReserve()) {
+                sendJson(exchange, 409,
+                        "{\"error\":\"agent_busy\",\"message\":\"Wait for the current agent turn to finish\"}");
+                return;
+            }
+            reserved = true;
+            localSessionCommand = isLocalSessionCommand(text);
+
+            Consumer<String> callback = onSendPrompt;
+            if (callback == null) {
+                sendJson(exchange, 503, "{\"error\":\"prompt_handler_unavailable\"}");
+                return;
+            }
+
+            if (!localSessionCommand) {
+                agentRunning = true;
+            }
+            callback.accept(text);
+            accepted = true;
+            exchange.sendResponseHeaders(204, -1);
+        } catch (Exception e) {
+            LOG.warn("[ChatWebServer] prompt handler error", e);
+            exchange.sendResponseHeaders(500, -1);
+        } finally {
+            if (reserved && (localSessionCommand || !accepted)) {
+                if (!localSessionCommand) {
+                    agentRunning = false;
+                }
+                promptAdmissionGate.release();
+            }
+            exchange.close();
+        }
+    }
+
+    private static boolean isLocalSessionCommand(String prompt) {
+        String command = prompt.strip();
+        return "/session-clear".equalsIgnoreCase(command)
+                || "/session-restart".equalsIgnoreCase(command);
+    }
+
     private void handleAction(HttpExchange exchange, Consumer<String> handler) throws IOException {
         exchange.getResponseHeaders().set(HDR_ACCESS_CONTROL_ORIGIN, "*");
         exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -2138,10 +2203,14 @@ public final class ChatWebServer implements Disposable {
     }
 
     private void sendJson(HttpExchange exchange, String json) throws IOException {
+        sendJson(exchange, 200, json);
+    }
+
+    private void sendJson(HttpExchange exchange, int status, String json) throws IOException {
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set(HDR_CONTENT_TYPE, JSON_CONTENT_TYPE);
         exchange.getResponseHeaders().set(HDR_ACCESS_CONTROL_ORIGIN, "*");
-        exchange.sendResponseHeaders(200, bytes.length);
+        exchange.sendResponseHeaders(status, bytes.length);
         exchange.getResponseBody().write(bytes);
         exchange.close();
     }
