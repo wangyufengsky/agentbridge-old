@@ -11,11 +11,12 @@ import java.time.Duration
  *
  * Points the tool at a *usage* of {@code navigationSymbol} ({@code navigationUsageFile}:{@code line})
  * and asserts the resolved declaration snippet mentions the symbol. This is the bench guard for
- * issue #794 bug #3: for C/C++ leaf identifiers {@code getReference()} is null, so
- * {@code GoToDeclarationTool} resolves via the platform's language-agnostic
- * {@code findReferenceAt}/{@code TargetElementUtil} path — a red cell means that path no longer
- * resolves against the real CLion Nova backend. RD has no {@code navigationUsageFile} yet, so the
- * cell skips ({@code assumeTrue}) and renders as not-implemented (❓).
+ * issue #794 bug #3: CLion Nova delegates {@code GotoDeclaration} to Rider.Backend instead of
+ * exposing C/C++ semantic targets through frontend PSI. The tool must therefore invoke the real
+ * IDE action in a live editor when frontend providers and PSI return nothing. A red cell means
+ * that end-to-end backend navigation no longer resolves in real CLion. RD has no
+ * {@code navigationUsageFile} yet, so the cell skips ({@code assumeTrue}) and renders as
+ * not-implemented (❓).
  */
 class GoToDeclarationIntegrationTest {
 

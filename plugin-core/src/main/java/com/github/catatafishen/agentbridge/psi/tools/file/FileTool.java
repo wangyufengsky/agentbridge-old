@@ -8,10 +8,11 @@ import com.github.catatafishen.agentbridge.psi.review.AgentEditSession;
 import com.github.catatafishen.agentbridge.psi.tools.Tool;
 import com.github.catatafishen.agentbridge.services.ToolRegistry;
 import com.github.catatafishen.agentbridge.settings.McpServerSettings;
+import com.intellij.codeInsight.actions.AbstractLayoutCodeProcessor;
 import com.intellij.codeInsight.actions.OptimizeImportsProcessor;
 import com.intellij.codeInsight.actions.ReformatCodeProcessor;
-import com.intellij.openapi.application.WriteAction;
-import com.intellij.openapi.command.WriteCommandAction;
+import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.application.ReadAction;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.editor.EditorCustomElementRenderer;
@@ -25,26 +26,33 @@ import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.fileEditor.FileEditorManager;
 import com.intellij.openapi.fileEditor.OpenFileDescriptor;
 import com.intellij.openapi.fileEditor.TextEditor;
+import com.intellij.openapi.progress.ProcessCanceledException;
+import com.intellij.openapi.progress.ProgressIndicator;
+import com.intellij.openapi.progress.ProgressManager;
+import com.intellij.openapi.progress.util.ProgressIndicatorBase;
 import com.intellij.openapi.project.Project;
-import com.intellij.openapi.vfs.ReadonlyStatusHandler;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.openapi.wm.ToolWindowManager;
-import com.intellij.psi.PsiDocumentManager;
 import com.intellij.psi.PsiFile;
 import com.intellij.psi.PsiManager;
 import com.intellij.util.Alarm;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.VisibleForTesting;
 
 import java.awt.*;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Abstract base for file tools. Provides shared static utilities for
@@ -69,167 +77,401 @@ public abstract class FileTool extends Tool {
 
     // ── Deferred auto-format (per-project) ────────────────────────────────────
 
+    private static final long AUTO_FORMAT_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(30);
+
     /**
-     * Maximum number of files to process in a single auto-format flush.
-     * Prevents EDT saturation when many files are queued: each file's format
-     * runs inside a WriteCommandAction (blocking EDT). Overflow is requeued.
+     * Bound each processor invocation so a timeout retains only a small failed chunk instead of
+     * restarting an arbitrarily large queue from the beginning on every retry.
      */
-    private static final int MAX_AUTO_FORMAT_FILES = 10;
+    @VisibleForTesting
+    static final int AUTO_FORMAT_BATCH_SIZE = 10;
 
     /**
      * Files larger than this threshold skip import optimization during deferred auto-format.
-     * OptimizeImportsProcessor resolves every symbol reference to determine unused imports —
-     * on large Kotlin files (e.g. 116 KB) this can block the EDT for 30+ seconds, causing
-     * cascading timeouts in write_file, run_command, and git_commit.
+     * Import optimization resolves every symbol reference to determine unused imports, so it
+     * remains size-guarded even though the processor now runs off the EDT.
      */
     public static final long MAX_BYTES_FOR_OPTIMIZE_IMPORTS = 50 * 1024L;
 
     /**
-     * Files larger than this threshold skip both optimize-imports and reformat during deferred
-     * auto-format. ReformatCodeProcessor on very large files can still block the EDT for
-     * 10–20 seconds — above this size it is safer to skip formatting entirely.
+     * Files larger than this threshold skip both import optimization and reformatting.
      */
     public static final long MAX_BYTES_FOR_REFORMAT = 100 * 1024L;
 
-    private static final ConcurrentHashMap<Project, Set<String>> PENDING_AUTO_FORMAT =
-        new ConcurrentHashMap<>();
+    /**
+     * Weak project keys keep per-project queues and locks scoped to the project lifetime.
+     * Access to the map itself is synchronized; each state protects its own ordered path set.
+     */
+    private static final Map<Project, AutoFormatState> AUTO_FORMAT_STATES =
+        Collections.synchronizedMap(new WeakHashMap<>());
 
     public static void queueAutoFormat(Project project, String path) {
-        PENDING_AUTO_FORMAT.computeIfAbsent(project,
-            k -> Collections.synchronizedSet(new LinkedHashSet<>())).add(path);
+        if (project.isDisposed()) return;
+        getOrCreateAutoFormatState(project).add(path);
     }
 
-    public static void flushPendingAutoFormat(Project project) {
-        Set<String> pathSet = PENDING_AUTO_FORMAT.remove(project);
-        if (pathSet == null || pathSet.isEmpty()) return;
-
-        List<String> paths = new ArrayList<>(pathSet);
-
-        // Safety cap: if too many files are queued, process only the first batch and requeue
-        // the rest. This prevents EDT saturation from blocking the editor for 30+ seconds.
-        if (paths.size() > MAX_AUTO_FORMAT_FILES) {
-            LOG.warn("Auto-format batch capped at " + MAX_AUTO_FORMAT_FILES + " of " + paths.size()
-                + " files; requeueing overflow for the next turn");
-            List<String> overflow = paths.subList(MAX_AUTO_FORMAT_FILES, paths.size());
-            PENDING_AUTO_FORMAT.merge(project,
-                Collections.synchronizedSet(new LinkedHashSet<>(overflow)),
-                (existing, added) -> {
-                    existing.addAll(added);
-                    return existing;
-                });
-            paths = new ArrayList<>(paths.subList(0, MAX_AUTO_FORMAT_FILES));
+    /**
+     * Flushes deferred formatting and returns only after the JetBrains processors and document
+     * save have actually completed.
+     *
+     * <p>The processor pipeline must run on a background thread. Calling this method from the EDT
+     * schedules a background flush and returns {@code false}; callers that require a durable
+     * working tree (notably Git write tools) must treat that as an incomplete flush and abort.
+     */
+    public static boolean flushPendingAutoFormat(Project project) {
+        if (project.isDisposed()) {
+            removeAutoFormatState(project);
+            return false;
         }
 
-        if (com.intellij.openapi.application.ApplicationManager.getApplication().isDispatchThread()) {
-            for (String pathStr : paths) {
-                formatSingleFile(project, pathStr);
-            }
-            saveAllDocuments();
-            return;
+        AutoFormatState state = getAutoFormatState(project);
+        if (state == null || state.isIdle()) return true;
+
+        if (ApplicationManager.getApplication().isDispatchThread()) {
+            ApplicationManager.getApplication().executeOnPooledThread(
+                () -> flushPendingAutoFormat(project));
+            return false;
         }
 
-        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
-        AtomicBoolean cancelled = new AtomicBoolean(false);
+        return flushOnBackgroundThread(project, state);
+    }
 
-        scheduleNextFormat(project, paths, 0, latch, cancelled);
+    private static boolean flushOnBackgroundThread(Project project, AutoFormatState state) {
+        return flushOnBackgroundThread(project, state, AUTO_FORMAT_TIMEOUT_NANOS);
+    }
 
+    @VisibleForTesting
+    static boolean flushOnBackgroundThread(Project project, AutoFormatState state,
+                                           long timeoutNanos) {
+        long deadlineNanos = System.nanoTime() + timeoutNanos;
         try {
-            if (!latch.await(30, java.util.concurrent.TimeUnit.SECONDS)) {
-                // Stop the EDT chain — without this, remaining invokeLater tasks would keep running
-                // after we return, blocking the EDT and causing subsequent invokeAndWait calls to time out.
-                cancelled.set(true);
-                LOG.warn("flushPendingAutoFormat timed out after 30 seconds");
+            if (!tryAcquireFlushLock(state, deadlineNanos)) {
+                LOG.warn("Deferred auto-format timed out waiting for another flush");
+                return false;
             }
         } catch (InterruptedException e) {
-            cancelled.set(true);
             Thread.currentThread().interrupt();
-            LOG.warn("flushPendingAutoFormat interrupted");
+            LOG.warn("Deferred auto-format interrupted while waiting for the flush lock");
+            return false;
         }
-    }
 
-    /**
-     * Chains auto-format operations sequentially via {@code invokeLater}, one file per EDT event.
-     * <p>
-     * Unlike bulk-dispatching all files at once, chaining allows the EDT to process paint and
-     * input events between each file — keeping the editor responsive during multi-file formatting.
-     * The {@code cancelled} flag is checked before each step so that a background-thread timeout
-     * in {@link #flushPendingAutoFormat} immediately stops further scheduling.
-     */
-    private static void scheduleNextFormat(Project project, List<String> paths, int index,
-                                           java.util.concurrent.CountDownLatch latch,
-                                           AtomicBoolean cancelled) {
-        if (cancelled.get() || project.isDisposed()) {
-            latch.countDown(); // no-op if background thread already timed out
-            return;
-        }
-        if (index >= paths.size()) {
-            saveAllDocuments();
-            latch.countDown();
-            return;
-        }
-        EdtUtil.invokeLater(() -> {
-            if (!cancelled.get() && !project.isDisposed()) {
-                formatSingleFile(project, paths.get(index));
-            }
-            scheduleNextFormat(project, paths, index + 1, latch, cancelled);
-        });
-    }
-
-    /**
-     * Formats and optimizes imports for a single file inside a write action.
-     *
-     * <p>Size-guarded: {@link OptimizeImportsProcessor} resolves every symbol in the file to
-     * detect unused imports — on large Kotlin files this can block the EDT for 30+ seconds.
-     * {@link ReformatCodeProcessor} is also expensive above ~100 KB. Files that exceed the
-     * configured thresholds are logged and skipped to prevent cascading tool timeouts.</p>
-     */
-    private static void formatSingleFile(Project project, String pathStr) {
         try {
-            VirtualFile vf = ToolUtils.resolveVirtualFile(project, pathStr);
-            if (vf == null) return;
-            long fileBytes = vf.getLength();
-            if (fileBytes > MAX_BYTES_FOR_REFORMAT) {
-                LOG.info("Deferred auto-format skipped (file too large for reformat: " + fileBytes + " bytes): " + pathStr);
-                return;
-            }
-            boolean runOptimizeImports = fileBytes <= MAX_BYTES_FOR_OPTIMIZE_IMPORTS;
-            PsiFile psiFile = PsiManager.getInstance(project).findFile(vf);
-            if (psiFile == null) return;
-            // AbstractLayoutCodeProcessor.runProcessFile() calls ensureFilesWritable() internally.
-            // For non-project files this may show an "unlock file?" dialog — which is illegal
-            // inside a write action (causes "AWT events not allowed inside write action").
-            // Pre-resolve write access here, outside the write action, so the dialog (if any)
-            // is shown before we acquire the write lock.
-            ReadonlyStatusHandler.OperationStatus writeStatus =
-                ReadonlyStatusHandler.getInstance(project).ensureFilesWritable(Collections.singletonList(vf));
-            if (writeStatus.hasReadonlyFiles()) {
-                LOG.info("Deferred auto-format skipped (read-only): " + pathStr);
-                return;
-            }
-            Document doc = psiFile.getViewProvider().getDocument();
-            WriteCommandAction.runWriteCommandAction(project, "Auto-Format (Deferred)", null, () -> {
-                if (doc != null)
-                    PsiDocumentManager.getInstance(project).commitDocument(doc);
-                if (runOptimizeImports) new OptimizeImportsProcessor(project, psiFile).run();
-                new ReformatCodeProcessor(psiFile, false).run();
-                if (doc != null)
-                    PsiDocumentManager.getInstance(project).commitDocument(doc);
-            });
-            if (runOptimizeImports) {
-                LOG.info("Deferred auto-format (optimize-imports + reformat): " + pathStr);
-            } else {
-                LOG.info("Deferred auto-format (reformat only, large file " + fileBytes + " bytes): " + pathStr);
-            }
-        } catch (Exception e) {
-            LOG.warn("Deferred auto-format failed for " + pathStr + ": " + e.getMessage());
+            return flushWhileLocked(project, state, deadlineNanos);
+        } finally {
+            state.flushLock.unlock();
         }
     }
 
-    private static void saveAllDocuments() {
+    private static boolean tryAcquireFlushLock(AutoFormatState state, long deadlineNanos)
+        throws InterruptedException {
+        long lockWaitNanos = deadlineNanos - System.nanoTime();
+        return lockWaitNanos > 0
+            && state.flushLock.tryLock(lockWaitNanos, TimeUnit.NANOSECONDS);
+    }
+
+    static boolean flushWhileLocked(Project project, AutoFormatState state,
+                                    long deadlineNanos) {
+        return flushWhileLocked(
+            project,
+            state,
+            deadlineNanos,
+            (paths, deadline) -> processAutoFormatBatch(project, paths, deadline));
+    }
+
+    @VisibleForTesting
+    static boolean flushWhileLocked(Project project, AutoFormatState state,
+                                    long deadlineNanos,
+                                    AutoFormatBatchProcessor processor) {
+        List<String> remainingPaths = List.of();
         try {
-            WriteAction.run(() -> FileDocumentManager.getInstance().saveAllDocuments());
-        } catch (Exception e) {
-            LOG.warn("Failed to save documents after auto-format", e);
+            while (!project.isDisposed()) {
+                if (remainingPaths.isEmpty()) {
+                    remainingPaths = state.drain();
+                    if (remainingPaths.isEmpty()) return true;
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    state.requeueFirst(remainingPaths);
+                    Thread.currentThread().interrupt();
+                    LOG.warn("Deferred auto-format interrupted before processing");
+                    return false;
+                }
+
+                int batchSize = Math.min(AUTO_FORMAT_BATCH_SIZE, remainingPaths.size());
+                List<String> currentBatch =
+                    new ArrayList<>(remainingPaths.subList(0, batchSize));
+                if (!processor.process(currentBatch, deadlineNanos)) {
+                    state.requeueFirst(remainingPaths);
+                    return false;
+                }
+                remainingPaths = batchSize == remainingPaths.size()
+                    ? List.of()
+                    : new ArrayList<>(remainingPaths.subList(batchSize, remainingPaths.size()));
+            }
+
+            state.requeueFirst(remainingPaths);
+            return false;
+        } catch (ProcessCanceledException e) {
+            state.requeueFirst(remainingPaths);
+            LOG.warn("Deferred auto-format cancelled before completion");
+            return false;
+        } catch (RuntimeException e) {
+            state.requeueFirst(remainingPaths);
+            LOG.warn("Deferred auto-format failed; queued files were retained", e);
+            return false;
+        }
+    }
+
+    private static boolean processAutoFormatBatch(Project project, List<String> paths,
+                                                  long deadlineNanos) {
+        return runAutoFormatWithDeadline(
+            deadlineNanos, indicator -> runAutoFormatBatch(project, paths, indicator));
+    }
+
+    @VisibleForTesting
+    static boolean runAutoFormatWithDeadline(long deadlineNanos,
+                                             AutoFormatBatchRunner runner) {
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos <= 0) {
+            LOG.warn("Deferred auto-format timed out before processing could start");
+            return false;
+        }
+
+        ProgressIndicatorBase indicator = new ProgressIndicatorBase();
+        ScheduledFuture<?> cancellation = com.intellij.util.concurrency.AppExecutorUtil
+            .getAppScheduledExecutorService()
+            .schedule(indicator::cancel, remainingNanos, TimeUnit.NANOSECONDS);
+        AtomicBoolean completed = new AtomicBoolean(false);
+        try {
+            ProgressManager.getInstance().runProcess(
+                () -> completed.set(runner.run(indicator)),
+                indicator);
+            if (indicator.isCanceled()) {
+                LOG.warn("Deferred auto-format exceeded the 30-second deadline");
+                return false;
+            }
+            return completed.get();
+        } finally {
+            cancellation.cancel(false);
+        }
+    }
+
+    private static boolean runAutoFormatBatch(Project project, List<String> paths,
+                                              ProgressIndicator indicator) {
+        return runAutoFormatBatch(
+            project,
+            paths,
+            indicator,
+            (files, optimizeImports) ->
+                runLayoutProcessor(project, files, optimizeImports, indicator),
+            FileDocumentManager.getInstance());
+    }
+
+    @VisibleForTesting
+    static boolean runAutoFormatBatch(Project project, List<String> paths,
+                                      ProgressIndicator indicator,
+                                      LayoutProcessorRunner runner,
+                                      FileDocumentManager documentManager) {
+        FormatPlan plan = createFormatPlan(project, paths, indicator);
+        boolean formatted = runFormatProcessors(
+            plan.optimizeAndReformat(),
+            plan.reformatOnly(),
+            runner);
+        if (!formatted) return false;
+
+        indicator.checkCanceled();
+        return saveProcessedDocuments(
+            documentManager, plan.documents(), paths.size());
+    }
+
+    @VisibleForTesting
+    static boolean runFormatProcessors(List<PsiFile> optimizeAndReformat,
+                                       List<PsiFile> reformatOnly,
+                                       LayoutProcessorRunner runner) {
+        if (!runner.run(optimizeAndReformat, true)) return false;
+        return runner.run(reformatOnly, false);
+    }
+
+    @VisibleForTesting
+    static boolean saveProcessedDocuments(FileDocumentManager documentManager,
+                                          List<Document> documents,
+                                          int processedPathCount) {
+        documentManager.saveAllDocuments();
+        for (Document document : documents) {
+            if (documentManager.isDocumentUnsaved(document)) {
+                LOG.warn("Deferred auto-format completed, but a processed document remained unsaved");
+                return false;
+            }
+        }
+
+        LOG.info("Deferred auto-format completed for " + processedPathCount + " queued file(s)");
+        return true;
+    }
+
+    private static FormatPlan createFormatPlan(Project project, List<String> paths,
+                                               ProgressIndicator indicator) {
+        List<PsiFile> optimizeAndReformat = new ArrayList<>();
+        List<PsiFile> reformatOnly = new ArrayList<>();
+        List<Document> documents = new ArrayList<>();
+
+        for (String path : paths) {
+            indicator.checkCanceled();
+            ResolvedFormatFile resolved = resolveFormatFile(project, path);
+            if (resolved != null) {
+                addToFormatPlan(resolved, optimizeAndReformat, reformatOnly, documents);
+            }
+        }
+
+        return new FormatPlan(optimizeAndReformat, reformatOnly, documents);
+    }
+
+    @Nullable
+    private static ResolvedFormatFile resolveFormatFile(Project project, String path) {
+        VirtualFile virtualFile = ToolUtils.resolveVirtualFile(project, path);
+        if (!isUsableFormatFile(virtualFile)) {
+            if (virtualFile != null && virtualFile.isValid() && !virtualFile.isWritable()) {
+                LOG.info("Deferred auto-format skipped (read-only): " + path);
+            }
+            return null;
+        }
+
+        long fileBytes = virtualFile.getLength();
+        if (fileBytes > MAX_BYTES_FOR_REFORMAT) {
+            LOG.info("Deferred auto-format skipped (file too large: "
+                + fileBytes + " bytes): " + path);
+            return null;
+        }
+
+        return ReadAction.nonBlocking(() -> {
+                PsiFile psiFile = PsiManager.getInstance(project).findFile(virtualFile);
+                if (psiFile == null) return null;
+                Document document = FileDocumentManager.getInstance().getDocument(virtualFile);
+                return new ResolvedFormatFile(psiFile, document, fileBytes);
+            })
+            .expireWith(project)
+            .executeSynchronously();
+    }
+
+    @VisibleForTesting
+    static boolean isUsableFormatFile(@Nullable VirtualFile virtualFile) {
+        return virtualFile != null && virtualFile.isValid() && virtualFile.isWritable();
+    }
+
+    @VisibleForTesting
+    static void addToFormatPlan(ResolvedFormatFile resolved,
+                                List<PsiFile> optimizeAndReformat,
+                                List<PsiFile> reformatOnly,
+                                List<Document> documents) {
+        if (resolved.document() != null) documents.add(resolved.document());
+        if (resolved.fileBytes() <= MAX_BYTES_FOR_OPTIMIZE_IMPORTS) {
+            optimizeAndReformat.add(resolved.psiFile());
+        } else {
+            reformatOnly.add(resolved.psiFile());
+        }
+    }
+
+    private static boolean runLayoutProcessor(Project project, List<PsiFile> files,
+                                              boolean optimizeImports,
+                                              ProgressIndicator indicator) {
+        if (files.isEmpty()) return true;
+
+        PsiFile[] fileArray = files.toArray(new PsiFile[0]);
+        AbstractLayoutCodeProcessor processor =
+            new ReformatCodeProcessor(project, fileArray, null, false);
+        if (optimizeImports) {
+            processor = new OptimizeImportsProcessor(processor);
+        }
+        processor.setProcessAllFilesAsSingleUndoStep(false);
+        return processor.processFilesUnderProgress(indicator);
+    }
+
+    private static AutoFormatState getOrCreateAutoFormatState(Project project) {
+        synchronized (AUTO_FORMAT_STATES) {
+            return AUTO_FORMAT_STATES.computeIfAbsent(project, ignored -> new AutoFormatState());
+        }
+    }
+
+    @Nullable
+    private static AutoFormatState getAutoFormatState(Project project) {
+        synchronized (AUTO_FORMAT_STATES) {
+            return AUTO_FORMAT_STATES.get(project);
+        }
+    }
+
+    private static void removeAutoFormatState(Project project) {
+        synchronized (AUTO_FORMAT_STATES) {
+            AUTO_FORMAT_STATES.remove(project);
+        }
+    }
+
+    @VisibleForTesting
+    record ResolvedFormatFile(PsiFile psiFile, @Nullable Document document, long fileBytes) {
+    }
+
+    private record FormatPlan(List<PsiFile> optimizeAndReformat,
+                              List<PsiFile> reformatOnly,
+                              List<Document> documents) {
+    }
+
+    @FunctionalInterface
+    interface AutoFormatBatchRunner {
+        boolean run(ProgressIndicator indicator);
+    }
+
+    @FunctionalInterface
+    interface AutoFormatBatchProcessor {
+        boolean process(List<String> paths, long deadlineNanos);
+    }
+
+    @FunctionalInterface
+    interface LayoutProcessorRunner {
+        boolean run(List<PsiFile> files, boolean optimizeImports);
+    }
+
+    @VisibleForTesting
+    static final class AutoFormatState {
+        private final LinkedHashSet<String> pendingPaths = new LinkedHashSet<>();
+        @VisibleForTesting
+        final ReentrantLock flushLock = new ReentrantLock();
+
+        void add(String path) {
+            synchronized (pendingPaths) {
+                pendingPaths.add(path);
+            }
+        }
+
+        @VisibleForTesting
+        boolean isIdle() {
+            if (!flushLock.tryLock()) return false;
+            try {
+                return !hasPending();
+            } finally {
+                flushLock.unlock();
+            }
+        }
+
+        private boolean hasPending() {
+            synchronized (pendingPaths) {
+                return !pendingPaths.isEmpty();
+            }
+        }
+
+        List<String> drain() {
+            synchronized (pendingPaths) {
+                if (pendingPaths.isEmpty()) return List.of();
+                List<String> paths = new ArrayList<>(pendingPaths);
+                pendingPaths.clear();
+                return paths;
+            }
+        }
+
+        void requeueFirst(List<String> paths) {
+            if (paths.isEmpty()) return;
+            synchronized (pendingPaths) {
+                LinkedHashSet<String> combined = new LinkedHashSet<>(paths);
+                combined.addAll(pendingPaths);
+                pendingPaths.clear();
+                pendingPaths.addAll(combined);
+            }
         }
     }
 
